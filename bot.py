@@ -3,11 +3,11 @@ import time
 import ccxt
 import pandas as pd
 import requests
-import threading # المكتبة الضرورية للتشغيل المتوازي
+import threading
 from enum import Enum
 
 # =========================================================
-# ① الإعدادات والربط (استخدم Secrets في Replit)
+# ① الإعدادات والربط
 # =========================================================
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -18,13 +18,13 @@ class Mode(Enum):
     DRY, LIVE = "DRY", "LIVE"
 
 class MarketState(Enum):
-    TRENDING, BALANCED, CHOPPY = "TRENDING", "BALANCED", "CHOPPY"
+    TRENDING, BALANCED, CHOPPY, EXHAUSTED = "TRENDING", "BALANCED", "CHOPPY", "EXHAUSTED"
 
 class TradeState(Enum):
-    IDLE, IN_TRADE = "IDLE", "IN_TRADE"
+    IDLE, IN_TRADE, BLOCKED = "IDLE", "IN_TRADE", "BLOCKED"
 
 # =========================================================
-# ② العقل الاحترافي المتكامل
+# ② العقل الاستراتيجي (Cumulative Quality Scoring)
 # =========================================================
 class BehavioralTradingBot:
     def __init__(self, symbol="BTC/USDT", balance=1000, risk_pct=0.01, mode=Mode.DRY):
@@ -33,13 +33,12 @@ class BehavioralTradingBot:
         self.risk_pct = risk_pct
         self.mode = mode
         self.trade_state = TradeState.IDLE
-        self.trades = []  # دعم التعزيز الذكي
+        self.trades = []
+        self.block_until = 0 
 
         self.exchange = ccxt.binance({
-            'apiKey': API_KEY,
-            'secret': API_SECRET,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
+            'apiKey': API_KEY, 'secret': API_SECRET,
+            'enableRateLimit': True, 'options': {'defaultType': 'spot'}
         })
 
     def notify(self, message):
@@ -50,130 +49,144 @@ class BehavioralTradingBot:
         except: pass
 
     def analyze_market(self, data):
-        if len(data) < 20: return MarketState.CHOPPY, False
+        """تحليل السياق المستقل وكفاءة الحركة"""
+        if len(data) < 30: return MarketState.CHOPPY, "نقص بيانات"
         last = data.iloc[-1]
-        prev = data.iloc[-5]
         
-        # كشف التريند و الرفض
-        is_trending = last['high'] > prev['high'] and last['low'] > prev['low']
-        lower_wick = min(last['open'], last['close']) - last['low']
+        net_change = abs(data['close'].iloc[-1] - data['close'].iloc[-10])
+        total_movement = data['close'].diff().abs().iloc[-10:].sum()
+        efficiency_ratio = net_change / total_movement if total_movement > 0 else 0
+
+        sma_20 = data['close'].rolling(20).mean().iloc[-1]
+        dist = (last['close'] - sma_20) / sma_20
+        if dist > 0.045: return MarketState.EXHAUSTED, "إنهاك"
+
         total_range = last['high'] - last['low']
-        rejection = lower_wick > (total_range * 0.5) if total_range > 0 else False
-        
-        volatility = data['close'].pct_change().std()
-        if volatility > 0.015: return MarketState.CHOPPY, rejection
-        
-        state = MarketState.TRENDING if is_trending else MarketState.BALANCED
-        return state, rejection
+        upper_wick = last['high'] - max(last['open'], last['close'])
+        lower_wick = min(last['open'], last['close']) - last['low']
+        has_rejection = (upper_wick > total_range * 0.4) or (lower_wick > total_range * 0.4)
+
+        if efficiency_ratio < 0.5 or has_rejection:
+            return MarketState.CHOPPY, "ضوضاء/رفض"
+
+        if last['close'] > data['close'].iloc[-15:-1].max() and efficiency_ratio > 0.65:
+            return MarketState.TRENDING, "سياق كفؤ"
+
+        return MarketState.BALANCED, "توازن"
 
     def execute_order(self, side, price, stop, reason):
+        if time.time() < self.block_until: return
         risk_usd = self.balance * self.risk_pct
         dist = abs(price - stop)
-        if dist == 0: return
-        
-        size = risk_usd / dist
+        size = risk_usd / dist if dist > 0 else 0
         size_prec = self.exchange.amount_to_precision(self.symbol, size)
         
-        msg = f"🔔 {reason} | السعر {price} | الستوب {stop}"
-        self.notify(msg)
-
+        self.notify(f"🚀 {reason}\nالسعر: {price} | الستوب: {stop}")
         if self.mode == Mode.LIVE:
             try:
                 order = self.exchange.create_order(self.symbol, 'market', side, size_prec)
-                self.notify(f"✅ تم التنفيذ الحي! ID: {order['id']}")
             except Exception as e:
-                self.notify(f"❌ خطأ تنفيذ: {e}")
+                self.notify(f"❌ خطأ: {e}")
                 return
 
-        self.trades.append({"entry": price, "stop": stop, "size": size_prec, "trailing": price})
+        # يبدأ السكور عند 1.0 ويزيد مع كل شمعة ناجحة
+        self.trades.append({"entry": price, "stop": stop, "size": size_prec, "quality_score": 1.0})
         self.trade_state = TradeState.IN_TRADE
 
-    def manage_logic(self, current_price):
-        """إدارة الوقف المتحرك والتأمين"""
-        for t in self.trades[:]:
-            # تأمين الصفقة عند ربح 1.5%
-            if current_price > t['entry'] * 1.015:
-                if t['stop'] < t['entry']:
-                    t['stop'] = t['entry']
-                    self.notify("🛡️ تم تحريك الستوب لنقطة الدخول (تأمين).")
-            
-            # الخروج
-            if current_price <= t['stop']:
-                self.notify(f"🛑 خروج بربح/خسارة عند {current_price}")
-                self.trades.remove(t)
+    def manage_logic(self, current_price, data):
+        """تطوير السكور التراكمي وإدارة الخروج"""
+        state, _ = self.analyze_market(data)
         
+        for t in self.trades[:]:
+            # 1. بناء السكور التراكمي (Cumulative Growth)
+            if state == MarketState.TRENDING:
+                t['quality_score'] = min(t['quality_score'] + 0.1, 2.5) # ينمو السكور بحد أقصى 2.5
+            else:
+                t['quality_score'] = max(t['quality_score'] - 0.2, 0.5) # ينخفض بسرعة عند التذبذب
+
+            # 2. التأمين (Break-even)
+            if current_price > t['entry'] * 1.012 and t['stop'] < t['entry']:
+                t['stop'] = t['entry']
+                self.notify("🛡️ تأمين: الوقف عند الدخول.")
+
+            # 3. الخروج السلوكي المرتبط بالسكور (Dynamic Threshold)
+            net_c = abs(data['close'].iloc[-1] - data['close'].iloc[-5])
+            vol = data['close'].diff().abs().iloc[-5:].sum()
+            curr_eff = net_c / vol if vol > 0 else 1
+            
+            # كلما زاد السكور، أصبح البوت أكثر صبراً (عتبة خروج أقل)
+            # سكور 1.0 -> عتبة 0.4 | سكور 2.0 -> عتبة 0.2
+            exit_threshold = 0.4 / t['quality_score'] 
+            
+            if curr_eff < exit_threshold:
+                self.notify(f"⚠️ خروج سلوكي: ضعف الجودة (Score: {round(t['quality_score'], 1)})")
+                self.close_trade(t)
+                continue
+
+            if current_price <= t['stop']:
+                if current_price < t['entry']:
+                    self.block_until = time.time() + (4 * 3600)
+                    self.notify("🛑 حظر 4 ساعات.")
+                self.close_trade(t)
+
+    def close_trade(self, trade):
+        if trade in self.trades: self.trades.remove(trade)
         if not self.trades: self.trade_state = TradeState.IDLE
 
 # =========================================================
-# ③ نظام الاستماع للأوامر (تليجرام)
+# ③ محرك التشغيل المستقل
 # =========================================================
+def run_trading_engine(bot):
+    bot.notify("🧠 نظام 'رصيد الثقة التراكمي' مفعل وجاهز.")
+    while True:
+        try:
+            ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, timeframe='15m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['t', 'open', 'high', 'low', 'close', 'vol'])
+            last_price = df['close'].iloc[-1]
+            
+            state, reason = bot.analyze_market(df)
+            bot.manage_logic(last_price, df)
+
+            if state == MarketState.TRENDING and len(bot.trades) < 2:
+                if time.time() > bot.block_until:
+                    can_enter = True
+                    # شرط الصفقة الثانية: سياق جديد + فارق سعري + سكور عالي للأولى
+                    if len(bot.trades) > 0:
+                        first_trade = bot.trades[0]
+                        price_diff = abs(last_price - first_trade['entry']) / first_trade['entry']
+                        # لا يسمح بالثانية إلا إذا كان سكور الأولى ارتفع (أثبتت جودتها)
+                        if price_diff < 0.015 or first_trade['quality_score'] < 1.3:
+                            can_enter = False 
+                    
+                    if can_enter:
+                        bot.execute_order("buy", last_price, df['low'].iloc[-5:].min(), "دخول سياقي معزز بجودة عالية")
+            
+        except Exception as e: print(f"⚠️ خطأ: {e}")
+        time.sleep(60)
+
+# (واجهة تليجرام المعتادة)
 def telegram_listener(bot_instance):
     offset = None
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            response = requests.get(url, params={"timeout": 10, "offset": offset}).json()
-
-            for update in response.get("result", []):
-                offset = update["update_id"] + 1
-                message = update.get("message", {})
-                text = message.get("text", "")
-
-                if text == "/start":
-                    bot_instance.notify("👋 أهلاً بك! النظام يعمل الآن.\nاستخدم القائمة للتحكم.")
-                elif text == "/dry":
-                    bot_instance.mode = Mode.DRY
-                    bot_instance.notify("🧪 تم التحويل لوضع DRY (تجريبي).")
-                elif text == "/live":
-                    bot_instance.mode = Mode.LIVE
-                    bot_instance.notify("⚠️ تنبيه: تم تفعيل التداول الحقيقي LIVE!")
+            r = requests.get(url, params={"timeout": 10, "offset": offset}).json()
+            for u in r.get("result", []):
+                offset = u["update_id"] + 1
+                text = u.get("message", {}).get("text", "")
+                if text == "/start": bot_instance.notify("🤖 نظام التوازن الأقصى مفعل.")
                 elif text == "/status":
-                    msg = f"📊 الحالة: {bot_instance.mode}\n💰 الرصيد: {bot_instance.balance}\n📦 الصفقات المفتوحة: {len(bot_instance.trades)}"
-                    bot_instance.notify(msg)
-
-        except Exception as e:
-            print(f"خطأ في مستمع تليجرام: {e}")
+                    status = "⏳ مُعلق" if time.time() < bot_instance.block_until else "✅ جاهز"
+                    score_msg = ""
+                    if bot_instance.trades:
+                        score_msg = f"\n🎯 سكور الجودة: {round(bot_instance.trades[0]['quality_score'], 1)}"
+                    bot_instance.notify(f"📊 الوضع: {bot_instance.mode}\n🛡️ الحالة: {status}\n📦 الصفقات: {len(bot_instance.trades)}{score_msg}")
+                elif text == "/dry": bot_instance.mode = Mode.DRY; bot_instance.notify("🧪 وضع DRY")
+                elif text == "/live": bot_instance.mode = Mode.LIVE; bot_instance.notify("⚠️ وضع LIVE")
+        except: pass
         time.sleep(1)
 
-# =========================================================
-# ④ حلقة التشغيل الأساسية (محرك التداول)
-# =========================================================
-def run_trading_engine(bot):
-    bot.notify("🚀 تم تشغيل النظام بنجاح.. بانتظار الفرصة الأولى.")
-    
-    while True:
-        try:
-            ohlcv = bot.exchange.fetch_ohlcv(bot.symbol, timeframe='15m', limit=50)
-            df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
-            last_price = df['close'].iloc[-1]
-            state, has_rejection = bot.analyze_market(df)
-
-            # 1. إدارة الصفقات المفتوحة
-            bot.manage_logic(last_price)
-
-            # 2. منطق الدخول والتعزيز
-            if state != MarketState.CHOPPY and has_rejection:
-                if bot.trade_state == TradeState.IDLE:
-                    bot.execute_order("buy", last_price, df['low'].iloc[-1], "دخول رئيسي")
-                elif len(bot.trades) < 2 and last_price > bot.trades[0]['entry'] * 1.02:
-                    bot.execute_order("buy", last_price, bot.trades[0]['entry'], "تعزيز ذكي")
-            
-        except Exception as e:
-            print(f"⚠️ خطأ في محرك التداول: {e}")
-        
-        time.sleep(60)
-
-# =========================================================
-# ⑤ نقطة الانطلاق الرسمية (Execution)
-# =========================================================
 if __name__ == "__main__":
-    # 1. تهيئة نسخة البوت
-    my_bot = BehavioralTradingBot() 
-
-    # 2. تشغيل "مستمع تليجرام" في مسار مستقل (Background Thread)
-    listener_thread = threading.Thread(target=telegram_listener, args=(my_bot,))
-    listener_thread.daemon = True # لضمان إغلاق المسار عند توقف البرنامج
-    listener_thread.start()
-
-    # 3. تشغيل محرك التداول الأساسي في المسار الرئيسي
+    my_bot = BehavioralTradingBot()
+    threading.Thread(target=telegram_listener, args=(my_bot,), daemon=True).start()
     run_trading_engine(my_bot)
