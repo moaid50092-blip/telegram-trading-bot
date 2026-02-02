@@ -3,6 +3,7 @@ import time
 import ccxt
 import pandas as pd
 import requests
+import threading # المكتبة الضرورية للتشغيل المتوازي
 from enum import Enum
 
 # =========================================================
@@ -104,10 +105,40 @@ class BehavioralTradingBot:
         if not self.trades: self.trade_state = TradeState.IDLE
 
 # =========================================================
-# ③ حلقة التشغيل
+# ③ نظام الاستماع للأوامر (تليجرام)
 # =========================================================
-def run():
-    bot = BehavioralTradingBot(mode=Mode.DRY)
+def telegram_listener(bot_instance):
+    offset = None
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            response = requests.get(url, params={"timeout": 10, "offset": offset}).json()
+
+            for update in response.get("result", []):
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                text = message.get("text", "")
+
+                if text == "/start":
+                    bot_instance.notify("👋 أهلاً بك! النظام يعمل الآن.\nاستخدم القائمة للتحكم.")
+                elif text == "/dry":
+                    bot_instance.mode = Mode.DRY
+                    bot_instance.notify("🧪 تم التحويل لوضع DRY (تجريبي).")
+                elif text == "/live":
+                    bot_instance.mode = Mode.LIVE
+                    bot_instance.notify("⚠️ تنبيه: تم تفعيل التداول الحقيقي LIVE!")
+                elif text == "/status":
+                    msg = f"📊 الحالة: {bot_instance.mode}\n💰 الرصيد: {bot_instance.balance}\n📦 الصفقات المفتوحة: {len(bot_instance.trades)}"
+                    bot_instance.notify(msg)
+
+        except Exception as e:
+            print(f"خطأ في مستمع تليجرام: {e}")
+        time.sleep(1)
+
+# =========================================================
+# ④ حلقة التشغيل الأساسية (محرك التداول)
+# =========================================================
+def run_trading_engine(bot):
     bot.notify("🚀 تم تشغيل النظام بنجاح.. بانتظار الفرصة الأولى.")
     
     while True:
@@ -128,9 +159,21 @@ def run():
                     bot.execute_order("buy", last_price, bot.trades[0]['entry'], "تعزيز ذكي")
             
         except Exception as e:
-            print(f"⚠️ خطأ: {e}")
+            print(f"⚠️ خطأ في محرك التداول: {e}")
         
         time.sleep(60)
 
+# =========================================================
+# ⑤ نقطة الانطلاق الرسمية (Execution)
+# =========================================================
 if __name__ == "__main__":
-    run()
+    # 1. تهيئة نسخة البوت
+    my_bot = BehavioralTradingBot() 
+
+    # 2. تشغيل "مستمع تليجرام" في مسار مستقل (Background Thread)
+    listener_thread = threading.Thread(target=telegram_listener, args=(my_bot,))
+    listener_thread.daemon = True # لضمان إغلاق المسار عند توقف البرنامج
+    listener_thread.start()
+
+    # 3. تشغيل محرك التداول الأساسي في المسار الرئيسي
+    run_trading_engine(my_bot)
