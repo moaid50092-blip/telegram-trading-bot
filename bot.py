@@ -7,7 +7,9 @@ import threading
 import numpy as np
 from enum import Enum
 
-# --- الإعدادات الثابتة ---
+# =========================================================
+# ① الإعدادات والعملات (تأكد من ضبط المتغيرات في البيئة)
+# =========================================================
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 API_KEY = os.getenv('BINANCE_API_KEY')
 API_SECRET = os.getenv('BINANCE_API_SECRET')
@@ -18,34 +20,56 @@ class Mode(Enum):
     DRY, LIVE = "DRY", "LIVE"
 
 class MarketState(Enum):
-    TRENDING, SPECULATIVE, BALANCED, CHOPPY, EXHAUSTED = "TRENDING", "SPECULATIVE", "BALANCED", "CHOPPY", "EXHAUSTED"
+    TRENDING, BALANCED, CHOPPY, EXHAUSTED = "TRENDING", "BALANCED", "CHOPPY", "EXHAUSTED"
 
+# =========================================================
+# ② محرك الذكاء السياقي (حل مشكلة NaN والصفر الدائم)
+# =========================================================
 class ContextAI:
     @staticmethod
     def calculate_score(df_raw):
+        # تنظيف البيانات فوراً لضمان عدم وجود قيم NaN تعطل الحسابات
         df = df_raw.copy().dropna()
-        if len(df) < 30: return 0
+        
+        # التأكد من توفر حد أدنى من البيانات بعد التنظيف
+        if len(df) < 30: 
+            return 0
+            
         last = df.iloc[-1]
         close = df['close']
         
-        # الكفاءة والاستقرار والرفض (نفس المنطق المعتمد)
+        # 1. الكفاءة (Efficiency) - 40%
         net_move = abs(close.iloc[-1] - close.iloc[-10])
         total_path = close.diff().abs().iloc[-10:].sum()
-        eff = (net_move / total_path) if (total_path > 0) else 0
+        eff = (net_move / total_path) if (total_path > 0 and not np.isnan(total_path)) else 0
         
+        # 2. استقرار التقلب (Volatility) - 15%
         short_vol = close.diff().abs().iloc[-5:].std()
         long_vol = close.diff().abs().iloc[-50:].std()
-        vol_score = 1 - min(short_vol / long_vol, 1) if long_vol > 0 else 0
+        vol_score = 0
+        if long_vol > 0 and not np.isnan(short_vol) and not np.isnan(long_vol):
+            vol_score = 1 - min(short_vol / long_vol, 1)
         
+        # 3. المسافة عن المتوسط (Distance) - 25% (مدى 0.1)
         sma = close.rolling(20).mean()
-        dist_score = max(0, 1 - (abs(last['close'] - sma.iloc[-1]) / (sma.iloc[-1] * 0.1))) if not sma.isna().all() else 0
+        dist_score = 0
+        if not sma.isna().all():
+            curr_sma = sma.iloc[-1]
+            dist = abs(last['close'] - curr_sma) / curr_sma
+            dist_score = max(0, 1 - (dist / 0.1))
         
+        # 4. غياب الرفض (Rejection) - 20%
         tr = last['high'] - last['low']
         wick = (last['high'] - max(last['open'], last['close'])) / tr if tr > 0 else 0
         rej_score = 1 - min(wick / 0.4, 1)
 
-        return round((eff * 40 + vol_score * 15 + dist_score * 25 + rej_score * 20), 2)
+        # الحساب النهائي الصافي
+        final_score = (eff * 40 + vol_score * 15 + dist_score * 25 + rej_score * 20)
+        return round(final_score, 2) if not np.isnan(final_score) else 0
 
+# =========================================================
+# ③ المحرك التنفيذي (Executive Engine)
+# =========================================================
 class InstitutionalBot:
     def __init__(self, balance=1000, risk_pct=0.01, mode=Mode.DRY):
         self.balance = balance
@@ -53,10 +77,12 @@ class InstitutionalBot:
         self.mode = mode
         self.trades = {s: [] for s in SYMBOLS}
         self.block_list = {s: 0 for s in SYMBOLS}
-        self.market_logs = {s: {"state": "Scanning", "score": 0, "reason": "Initializing..."} for s in SYMBOLS}
-        self.exchange = ccxt.binance({'apiKey': API_KEY, 'secret': API_SECRET, 'enableRateLimit': True})
+        # سجل التفسير الحقيقي
+        self.market_logs = {s: {"state": "Scanning", "score": 0, "reason": "جاري التحليل الأولي..."} for s in SYMBOLS}
+        self.exchange = ccxt.binance({'apiKey': API_KEY, 'secret': API_SECRET, 'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
     def notify(self, message):
+        print(f"📡 {message}")
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             requests.post(url, json={"chat_id": CHAT_ID, "text": f"🤖 {message}", "parse_mode": "Markdown"})
@@ -68,57 +94,101 @@ class InstitutionalBot:
         sma_20 = df['close'].rolling(20).mean().iloc[-1]
         
         state = MarketState.BALANCED
-        reason = f"صمت: السياق ({score}) غير كافٍ"
-
-        # الطبقة الأساسية (Trending)
-        if score > 45 and last['close'] > df['close'].iloc[-15:-1].max():
+        reason = f"صمت: جودة السياق ({score}) لم تصل للحد الأدنى (45)"
+        
+        if (last['close'] - sma_20) / sma_20 > 0.08:
+            state = MarketState.EXHAUSTED
+            reason = "امتناع: تمدد سعري حاد (إنهاك)"
+        elif score > 45 and last['close'] > df['close'].iloc[-15:-1].max():
             state = MarketState.TRENDING
-            reason = "إيجابي: تريند نقي مكتمل الأركان"
-        
-        # طبقة المراقبة الاختيارية (Speculative) - المضافة حديثاً
-        elif 35 <= score <= 45 and last['close'] > df['close'].iloc[-5:-1].max():
-            state = MarketState.SPECULATIVE
-            reason = "تجريبي: بوادر زخم (دخول صغير بنصف المخاطرة)"
-        
+            reason = "إيجابي: سياق تريند معتمد كفؤ"
         elif score < 25:
             state = MarketState.CHOPPY
-            reason = "امتناع: ضجيج عالي"
+            reason = "امتناع: ضجيج وتذبذب عشوائي"
 
         self.market_logs[symbol] = {"state": state.name, "score": score, "reason": reason}
         return state, score
+
+    def manage_logic(self, symbol, current_price, df, context_score):
+        for t in self.trades[symbol][:]:
+            t['quality_score'] = min(t['quality_score'] + 0.1, 2.5) if context_score > 45 else max(t['quality_score'] - 0.2, 0.5)
+            if current_price > t['entry'] * 1.012 and t['stop'] < t['entry']:
+                t['stop'] = t['entry']
+                self.notify(f"🛡️ {symbol}: تأمين الأرباح.")
+            
+            # خروج سلوكي مرن
+            exit_barrier = 30 / t['quality_score']
+            if context_score < exit_barrier:
+                self.notify(f"⚠️ {symbol}: خروج سلوكي (ضعف الجودة: {context_score})")
+                self.trades[symbol].remove(t)
+                continue
+
+            if current_price <= t['stop']:
+                if current_price < t['entry']:
+                    self.block_list[symbol] = time.time() + (4 * 3600)
+                self.trades[symbol].remove(t)
 
     def run_cycle(self):
         total_active = sum(len(v) for v in self.trades.values())
         for symbol in SYMBOLS:
             try:
+                # طلب عدد أكبر من الشموع (70) لتعويض الـ dropna
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=70)
                 df = pd.DataFrame(ohlcv, columns=['t', 'open', 'high', 'low', 'close', 'v'])
                 last_price = df['close'].iloc[-1]
                 
                 state, score = self.analyze_market(symbol, df)
-                
-                # منطق الدخول
-                if (state in [MarketState.TRENDING, MarketState.SPECULATIVE]) and total_active < 2:
-                    if time.time() > self.block_list[symbol] and not self.trades[symbol]:
-                        
-                        # حساب المخاطرة بناءً على نوع الدخول
-                        current_risk = self.risk_pct if state == MarketState.TRENDING else (self.risk_pct * 0.5)
-                        stop = df['low'].iloc[-5:].min() if state == MarketState.TRENDING else df['low'].iloc[-2:].min()
-                        
-                        self.trades[symbol].append({"entry": last_price, "stop": stop, "type": state.name, "quality_score": 1.0})
-                        self.notify(f"🚀 *دخول {state.name} في {symbol}*\nالسكور: `{score}`\nالمخاطرة: `{current_risk*100}%`")
-                
-                # إدارة الخروج (نفس منطقك المعتمد)
-                self.manage_logic(symbol, last_price, score)
-                
+                self.manage_logic(symbol, last_price, df, score)
+
+                if state == MarketState.TRENDING and total_active < 2 and time.time() > self.block_list[symbol]:
+                    can_enter = True
+                    if self.trades[symbol]:
+                        first = self.trades[symbol][0]
+                        if abs(last_price - first['entry'])/first['entry'] < 0.015:
+                            can_enter = False
+                    
+                    if can_enter:
+                        stop = df['low'].iloc[-5:].min()
+                        self.trades[symbol].append({"entry": last_price, "stop": stop, "quality_score": 1.0})
+                        self.notify(f"🚀 *دخول {symbol}*\nالدرجة السياقية: `{score}/100`")
+            
             except Exception as e: print(f"Error {symbol}: {e}")
+            time.sleep(1.5)
 
-    def manage_logic(self, symbol, current_price, context_score):
-        for t in self.trades[symbol][:]:
-            if current_price <= t['stop']:
-                self.trades[symbol].remove(t)
-                self.block_list[symbol] = time.time() + 14400 # حظر 4 ساعات
-                self.notify(f"🛑 خروج {symbol} عند الستوب.")
+# =========================================================
+# ④ واجهة تليجرام (أمر /explain و /status)
+# =========================================================
+def telegram_listener(bot):
+    offset = None
+    bot.notify("🏛️ **النظام مفعل ومصحح حسابياً**\nأمر `/explain` سيعرض لك النبض الحقيقي الآن.")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            r = requests.get(url, params={"timeout": 10, "offset": offset}).json()
+            for u in r.get("result", []):
+                offset = u["update_id"] + 1
+                text = u.get("message", {}).get("text", "")
+                
+                if text == "/explain":
+                    msg = "🔍 **تحليل السوق الحقيقي:**\n"
+                    for s in SYMBOLS:
+                        log = bot.market_logs[s]
+                        status = "🚫 محظور" if time.time() < bot.block_list[s] else "✅ متاح"
+                        msg += f"\n🪙 *{s}*\n  • الحالة: `{log['state']}`\n  • الجودة: `{log['score']}/100`\n  • التفسير: _{log['reason']}_\n  • التنفيذ: {status}\n"
+                    bot.notify(msg)
+                
+                elif text == "/status":
+                    active = sum(len(v) for v in bot.trades.values())
+                    bot.notify(f"📊 **حالة الحساب ({bot.mode.value})**\nالصفقات النشطة: {active}/2")
+                
+                elif text == "/dry": bot.mode = Mode.DRY; bot.notify("🧪 تحويل لـ DRY")
+                elif text == "/live": bot.mode = Mode.LIVE; bot.notify("⚠️ تحويل لـ LIVE")
+        except: pass
+        time.sleep(1)
 
-# --- تشغيل البوت وواجهة تليجرام ---
-# (استخدم نفس نظام الـ Threading المعتمد في رسائلك السابقة)
+if __name__ == "__main__":
+    my_bot = InstitutionalBot()
+    threading.Thread(target=telegram_listener, args=(my_bot,), daemon=True).start()
+    while True:
+        my_bot.run_cycle()
+        time.sleep(30)
