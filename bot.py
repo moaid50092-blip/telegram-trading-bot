@@ -94,7 +94,6 @@ class CapitalManager:
         self.total_loss_limit = initial_capital * MAX_TOTAL_LOSS
         self.daily_loss = 0
         self.total_loss = 0
-        self.trade_history = []
         self.last_reset_date = datetime.now(timezone.utc).date()
         
     def reset_daily_stats(self):
@@ -178,7 +177,7 @@ class ThreePhaseTradeManager:
         self.capital_manager.update_after_trade(exit_status, trade['investment'], abs(pnl))
         self.capital_manager.notify(f"🏁 خروج: {trade['symbol']} | PnL: ${pnl:.2f} | السبب: {reason}")
 
-# ==================== STABLE TRADING SYSTEM (WITH ENTRY FILTER) ====================
+# ==================== STABLE TRADING SYSTEM ====================
 class StableTradingSystem:
     def __init__(self):
         self.capital_manager = CapitalManager(INITIAL_CAPITAL)
@@ -196,31 +195,21 @@ class StableTradingSystem:
             except Exception as e: logger.error(f"Market Load Error: {e}")
         threading.Thread(target=_load, daemon=True).start()
 
-    # --- فلتر قوة الدخول الإضافي (Minimal & Independent) ---
     def calculate_context_score(self, df):
         try:
             if len(df) < 30: return 0
-            
-            # 1. Efficiency: Net Move / Total Path (10 periods)
             net_move = abs(df['close'].iloc[-1] - df['close'].iloc[-10])
             path = df['close'].diff().abs().iloc[-10:].sum()
             efficiency = (net_move / path) * 40 if path > 0 else 0
-            
-            # 2. Volatility Ratio: ATR Short (5) / ATR Long (20)
             atr_s = (df['high'] - df['low']).rolling(5).mean().iloc[-1]
             atr_l = (df['high'] - df['low']).rolling(20).mean().iloc[-1]
             vol_ratio = min((atr_s / atr_l), 1.5) * 20 if atr_l > 0 else 0
-            
-            # 3. SMA20 Distance (Trend bias)
             sma20 = df['close'].rolling(20).mean().iloc[-1]
             dist_score = 20 if df['close'].iloc[-1] > sma20 else 5
-            
-            # 4. Rejection (Upper wick of last candle)
             last = df.iloc[-1]
             candle_range = last['high'] - last['low']
             upper_wick = last['high'] - max(last['open'], last['close'])
             rejection_penalty = (upper_wick / candle_range) * 30 if candle_range > 0 else 0
-            
             final_score = efficiency + vol_ratio + dist_score - rejection_penalty
             return round(max(min(final_score, 100), 0), 2)
         except: return 0
@@ -229,10 +218,8 @@ class StableTradingSystem:
         try:
             can_trade, _ = self.liquidity_timer.is_optimal_time()
             if not can_trade: return
-            
             current_prices = {}
             ohlcv_data = {}
-            
             for symbol in SYMBOLS:
                 try:
                     bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
@@ -240,13 +227,11 @@ class StableTradingSystem:
                     current_prices[symbol] = df['close'].iloc[-1]
                     ohlcv_data[symbol] = df
                 except: continue
-
             for t_id in list(self.trade_manager.active_trades.keys()):
                 price = current_prices.get(self.trade_manager.active_trades[t_id]['symbol'])
                 if price:
                     self.trade_manager.manage_trade_phase(t_id, price)
                     self.trade_manager.check_exit_conditions(t_id, price)
-            
             self.entry_scanning(current_prices, ohlcv_data)
         except Exception as e: logger.error(f"Cycle Error: {e}")
 
@@ -254,21 +239,15 @@ class StableTradingSystem:
         if len(self.trade_manager.active_trades) < 3:
             for symbol, price in current_prices.items():
                 if not any(t['symbol'] == symbol for t in self.trade_manager.active_trades.values()):
-                    
-                    # --- تطبيق فلتر قوة الدخول الجديد ---
                     score = self.calculate_context_score(ohlcv_data[symbol])
-                    if score < 40: continue # تجاهل أي فرصة ضعيفة
-                    
-                    # شروط مالية
+                    if score < 40: continue
                     pos_size = self.capital_manager.current_capital * MAX_CAPITAL_PER_TRADE
                     can, _ = self.capital_manager.can_open_trade(symbol, pos_size)
-                    
                     if can:
-                        logger.info(f"Entry Approved for {symbol} | Context Score: {score}")
                         self.trade_manager.create_trade(symbol, price, pos_size/price, score)
                         break
 
-# ==================== MAIN EXECUTION ====================
+# ==================== MAIN EXECUTION AND TELEGRAM INTERFACE ====================
 if __name__ == "__main__":
     bot_system = StableTradingSystem()
 
@@ -284,16 +263,42 @@ if __name__ == "__main__":
                         self.offset = update["update_id"] + 1
                         if "message" in update: self.handle_command(update["message"]["chat"]["id"], update["message"].get("text", ""))
                 except: time.sleep(10)
+
         def handle_command(self, chat_id, text):
             if not text: return
             cmd = text.split()[0]
+            
+            # --- الإضافات الجديدة داخل handle_command فقط ---
             if cmd == "/status":
                 msg = f"💰 المحفظة: ${self.system.capital_manager.current_capital:.2f}\n"
                 msg += f"📊 الصفقات: {len(self.system.trade_manager.active_trades)}/3"
                 self.send(chat_id, msg)
-            elif cmd == "/dry": self.send(chat_id, "🧪 وضع المحاكاة: نـشط")
+            
+            elif cmd == "/trades":
+                active = self.system.trade_manager.active_trades
+                if not active:
+                    self.send(chat_id, "📭 لا توجد صفقات مفتوحة حالياً.")
+                else:
+                    msg = "📑 الصفقات المفتوحة:\n"
+                    for tid, t in active.items():
+                        msg += f"🔹 {t['symbol']}: دحول @{t['entry_price']:.4f} | المرحلة: {t['phase'].value}\n"
+                    self.send(chat_id, msg)
+            
+            elif cmd == "/market":
+                is_opt, reason = self.system.liquidity_timer.is_optimal_time()
+                status = "🟢 جيد" if is_opt else "🔴 منخفض"
+                msg = f"🌐 حالة السوق: {status}\n🕒 التوقيت: {reason}\n📅 UTC: {datetime.now(timezone.utc).strftime('%H:%M')}"
+                self.send(chat_id, msg)
+            
+            elif cmd == "/ping":
+                self.send(chat_id, "🏓 Pong! البوت يعمل بنجاح.")
+            
+            elif cmd == "/dry": 
+                self.send(chat_id, "🧪 وضع المحاكاة: نـشط")
+
         def send(self, chat_id, text):
-            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text})
+            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
+                               json={"chat_id": chat_id, "text": text}, timeout=5)
             except: pass
 
     if TELEGRAM_TOKEN and CHAT_ID:
