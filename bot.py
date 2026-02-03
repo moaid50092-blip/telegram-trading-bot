@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 warnings.filterwarnings('ignore')
 
+# ==================== 1️⃣ TRADING MODE CONFIGURATION ====================
+TRADING_MODE = "DRY"  # غير القيمة إلى "LIVE" للتداول الحقيقي
+
 # ==================== CONFIGURATION ====================
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
 INITIAL_CAPITAL = 1000
@@ -22,10 +25,6 @@ MAX_CAPITAL_PER_TRADE = 0.1
 STOP_LOSS_PERCENT = 0.02
 TAKE_PROFIT_PERCENT = 0.04
 MAX_DAILY_LOSS = 0.05
-MAX_TOTAL_LOSS = 0.2
-
-OPTIMAL_HOURS = list(range(8, 22))
-AVOID_HOURS = [0, 1, 2, 3, 4, 5]
 
 BREAKEVEN_TRIGGER = 0.012
 TRAILING_ACTIVATION = 0.03
@@ -33,6 +32,8 @@ TRAILING_DISTANCE = 0.01
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+BINANCE_KEY = os.getenv('BINANCE_API_KEY')
+BINANCE_SECRET = os.getenv('BINANCE_SECRET_KEY')
 
 # ==================== LOGGING SYSTEM ====================
 class UTCFormatter(logging.Formatter):
@@ -63,37 +64,13 @@ class TradePhase(Enum):
     PHASE_2_BREAKEVEN = "PHASE_2_BREAKEVEN"
     PHASE_3_TRAILING = "PHASE_3_TRAILING"
 
-class MarketState(Enum):
-    TRENDING = "TRENDING"
-    SPECULATIVE = "SPECULATIVE"
-    BALANCED = "BALANCED"
-
-# ==================== LIQUIDITY TIMER ====================
-class LiquidityTimer:
-    @staticmethod
-    def is_optimal_time():
-        now_utc = datetime.now(timezone.utc)
-        current_hour = now_utc.hour
-        current_weekday = now_utc.weekday()
-        if current_weekday >= 5: return False, "نهاية الأسبوع"
-        if current_hour in AVOID_HOURS: return False, f"ساعة {current_hour} UTC"
-        return True, f"ساعة {current_hour} UTC"
-
-    @staticmethod
-    def get_sleep_duration():
-        current_hour = datetime.now(timezone.utc).hour
-        return 180 if current_hour in OPTIMAL_HOURS else 300
-
 # ==================== CAPITAL MANAGER ====================
 class CapitalManager:
     def __init__(self, initial_capital):
-        self.initial_capital = initial_capital
         self.current_capital = initial_capital
         self.available_capital = initial_capital
         self.daily_loss_limit = initial_capital * MAX_DAILY_LOSS
-        self.total_loss_limit = initial_capital * MAX_TOTAL_LOSS
         self.daily_loss = 0
-        self.total_loss = 0
         self.last_reset_date = datetime.now(timezone.utc).date()
         
     def reset_daily_stats(self):
@@ -116,22 +93,37 @@ class CapitalManager:
             self.current_capital -= profit_loss
             self.available_capital += (investment - profit_loss)
             self.daily_loss += profit_loss
-        logger.info(f"Update: Capital ${self.current_capital:.2f}")
+        logger.info(f"Capital Update: ${self.current_capital:.2f}")
 
     def notify(self, message):
+        mode_tag = f"🔴 [LIVE]" if TRADING_MODE == "LIVE" else "🧪 [DRY]"
+        full_msg = f"{mode_tag}\n{message}"
         if TELEGRAM_TOKEN and CHAT_ID:
             try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                               json={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+                               json={"chat_id": CHAT_ID, "text": full_msg, "parse_mode": "Markdown"}, timeout=10)
             except: pass
 
 # ==================== THREE-PHASE TRADE MANAGER ====================
 class ThreePhaseTradeManager:
-    def __init__(self, capital_manager):
+    def __init__(self, capital_manager, exchange):
         self.capital_manager = capital_manager
+        self.exchange = exchange
         self.active_trades = {}
         self.trade_counter = 0
 
     def create_trade(self, symbol, entry_price, quantity, context_score):
+        # تنفيذ شراء حقيقي في وضع LIVE
+        if TRADING_MODE == "LIVE":
+            try:
+                if not BINANCE_KEY or not BINANCE_SECRET:
+                    raise ValueError("مفاتيح API مفقودة!")
+                order = self.exchange.create_market_buy_order(symbol, quantity)
+                entry_price = order.get('price', entry_price)
+                logger.info(f"LIVE BUY EXECUTED: {symbol} at {entry_price}")
+            except Exception as e:
+                logger.error(f"LIVE BUY FAILED: {e}")
+                return None
+
         trade_id = f"TRADE_{self.trade_counter:04d}"
         self.trade_counter += 1
         trade = {
@@ -139,14 +131,13 @@ class ThreePhaseTradeManager:
             'current_stop_loss': entry_price * (1 - STOP_LOSS_PERCENT),
             'take_profit': entry_price * (1 + TAKE_PROFIT_PERCENT),
             'quantity': quantity, 'investment': quantity * entry_price,
-            'status': TradeStatus.ACTIVE, 'phase': TradePhase.PHASE_1_ENTRY,
-            'entry_time': datetime.now(timezone.utc), 'highest_price': entry_price,
+            'phase': TradePhase.PHASE_1_ENTRY, 'highest_price': entry_price,
             'breakeven_price': entry_price * (1 + BREAKEVEN_TRIGGER),
             'trailing_activation_price': entry_price * (1 + TRAILING_ACTIVATION),
-            'trailing_active': False, 'score': context_score
+            'trailing_active': False
         }
         self.active_trades[trade_id] = trade
-        self.capital_manager.notify(f"🎯 دخول ذكي: {symbol}\nالسعر: {entry_price:.4f}\nقوة الدخول: {context_score:.1f}")
+        self.capital_manager.notify(f"🚀 دخول صفقة: {symbol}\nالسعر: {entry_price:.4f}\nقوة الفرصة: {context_score}")
         return trade_id
 
     def manage_trade_phase(self, trade_id, current_price):
@@ -167,32 +158,43 @@ class ThreePhaseTradeManager:
         trade = self.active_trades.get(trade_id)
         if not trade: return
         if current_price <= trade['current_stop_loss']:
-            self.execute_exit(trade_id, current_price, TradeStatus.LOSS if current_price < trade['entry_price'] else TradeStatus.WIN, "Exit Condition")
+            self.execute_exit(trade_id, current_price, TradeStatus.LOSS if current_price < trade['entry_price'] else TradeStatus.WIN, "خروج آمن/تتبع")
         elif not trade['trailing_active'] and current_price >= trade['take_profit']:
-            self.execute_exit(trade_id, current_price, TradeStatus.WIN, "Take Profit")
+            self.execute_exit(trade_id, current_price, TradeStatus.WIN, "هدف الربح")
 
     def execute_exit(self, trade_id, exit_price, exit_status, reason):
         trade = self.active_trades.pop(trade_id)
+        # تنفيذ بيع حقيقي في وضع LIVE
+        if TRADING_MODE == "LIVE":
+            try:
+                self.exchange.create_market_sell_order(trade['symbol'], trade['quantity'])
+                logger.info(f"LIVE SELL EXECUTED: {trade['symbol']}")
+            except Exception as e:
+                logger.error(f"LIVE SELL FAILED: {e}")
+
         pnl = (exit_price - trade['entry_price']) * trade['quantity']
         self.capital_manager.update_after_trade(exit_status, trade['investment'], abs(pnl))
-        self.capital_manager.notify(f"🏁 خروج: {trade['symbol']} | PnL: ${pnl:.2f} | السبب: {reason}")
+        self.capital_manager.notify(f"🏁 خروج: {trade['symbol']}\nالربح/الخسارة: ${pnl:.2f}\nالسبب: {reason}")
 
 # ==================== STABLE TRADING SYSTEM ====================
 class StableTradingSystem:
     def __init__(self):
+        self.exchange = self._init_exchange()
         self.capital_manager = CapitalManager(INITIAL_CAPITAL)
-        self.trade_manager = ThreePhaseTradeManager(self.capital_manager)
-        self.liquidity_timer = LiquidityTimer()
-        self.exchange = ccxt.binance({'enableRateLimit': True})
+        self.trade_manager = ThreePhaseTradeManager(self.capital_manager, self.exchange)
         self.markets_loaded = False
         self.load_markets_async()
 
+    def _init_exchange(self):
+        params = {'enableRateLimit': True}
+        if TRADING_MODE == "LIVE" and BINANCE_KEY and BINANCE_SECRET:
+            params.update({'apiKey': BINANCE_KEY, 'secret': BINANCE_SECRET})
+        return ccxt.binance(params)
+
     def load_markets_async(self):
         def _load():
-            try:
-                self.exchange.load_markets()
-                self.markets_loaded = True
-            except Exception as e: logger.error(f"Market Load Error: {e}")
+            try: self.exchange.load_markets(); self.markets_loaded = True
+            except: pass
         threading.Thread(target=_load, daemon=True).start()
 
     def calculate_context_score(self, df):
@@ -210,16 +212,13 @@ class StableTradingSystem:
             candle_range = last['high'] - last['low']
             upper_wick = last['high'] - max(last['open'], last['close'])
             rejection_penalty = (upper_wick / candle_range) * 30 if candle_range > 0 else 0
-            final_score = efficiency + vol_ratio + dist_score - rejection_penalty
-            return round(max(min(final_score, 100), 0), 2)
+            return round(max(min(efficiency + vol_ratio + dist_score - rejection_penalty, 100), 0), 2)
         except: return 0
 
     def run_trading_cycle(self):
         try:
-            can_trade, _ = self.liquidity_timer.is_optimal_time()
-            if not can_trade: return
-            current_prices = {}
-            ohlcv_data = {}
+            # 2️⃣ إلغاء فلتر التوقيت: النظام يعمل الآن 24/7 بناءً على التحليل فقط
+            current_prices, ohlcv_data = {}, {}
             for symbol in SYMBOLS:
                 try:
                     bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
@@ -227,11 +226,13 @@ class StableTradingSystem:
                     current_prices[symbol] = df['close'].iloc[-1]
                     ohlcv_data[symbol] = df
                 except: continue
+            
             for t_id in list(self.trade_manager.active_trades.keys()):
                 price = current_prices.get(self.trade_manager.active_trades[t_id]['symbol'])
                 if price:
                     self.trade_manager.manage_trade_phase(t_id, price)
                     self.trade_manager.check_exit_conditions(t_id, price)
+            
             self.entry_scanning(current_prices, ohlcv_data)
         except Exception as e: logger.error(f"Cycle Error: {e}")
 
@@ -247,7 +248,7 @@ class StableTradingSystem:
                         self.trade_manager.create_trade(symbol, price, pos_size/price, score)
                         break
 
-# ==================== MAIN EXECUTION AND TELEGRAM INTERFACE ====================
+# ==================== EXECUTION ====================
 if __name__ == "__main__":
     bot_system = StableTradingSystem()
 
@@ -263,51 +264,26 @@ if __name__ == "__main__":
                         self.offset = update["update_id"] + 1
                         if "message" in update: self.handle_command(update["message"]["chat"]["id"], update["message"].get("text", ""))
                 except: time.sleep(10)
-
         def handle_command(self, chat_id, text):
             if not text: return
             cmd = text.split()[0]
-            
-            # --- الإضافات الجديدة داخل handle_command فقط ---
             if cmd == "/status":
-                msg = f"💰 المحفظة: ${self.system.capital_manager.current_capital:.2f}\n"
-                msg += f"📊 الصفقات: {len(self.system.trade_manager.active_trades)}/3"
+                msg = f"💰 المحفظة: ${self.system.capital_manager.current_capital:.2f}\n📊 الصفقات: {len(self.system.trade_manager.active_trades)}/3\n⚙️ الوضع: {TRADING_MODE}"
                 self.send(chat_id, msg)
-            
-            elif cmd == "/trades":
-                active = self.system.trade_manager.active_trades
-                if not active:
-                    self.send(chat_id, "📭 لا توجد صفقات مفتوحة حالياً.")
-                else:
-                    msg = "📑 الصفقات المفتوحة:\n"
-                    for tid, t in active.items():
-                        msg += f"🔹 {t['symbol']}: دحول @{t['entry_price']:.4f} | المرحلة: {t['phase'].value}\n"
-                    self.send(chat_id, msg)
-            
-            elif cmd == "/market":
-                is_opt, reason = self.system.liquidity_timer.is_optimal_time()
-                status = "🟢 جيد" if is_opt else "🔴 منخفض"
-                msg = f"🌐 حالة السوق: {status}\n🕒 التوقيت: {reason}\n📅 UTC: {datetime.now(timezone.utc).strftime('%H:%M')}"
-                self.send(chat_id, msg)
-            
-            elif cmd == "/ping":
-                self.send(chat_id, "🏓 Pong! البوت يعمل بنجاح.")
-            
-            elif cmd == "/dry": 
-                self.send(chat_id, "🧪 وضع المحاكاة: نـشط")
+            elif cmd == "/ping": self.send(chat_id, "🏓 Pong! النظام يعمل 24/7")
 
         def send(self, chat_id, text):
-            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                               json={"chat_id": chat_id, "text": text}, timeout=5)
+            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text})
             except: pass
 
     if TELEGRAM_TOKEN and CHAT_ID:
         threading.Thread(target=TelegramInterface(bot_system).start_polling, daemon=True).start()
 
+    logger.info(f"Bot started in {TRADING_MODE} mode (No Time Filter).")
     while True:
         try:
             bot_system.run_trading_cycle()
-            time.sleep(bot_system.liquidity_timer.get_sleep_duration())
+            time.sleep(180) # دورة كل 3 دقائق
         except KeyboardInterrupt: break
         except Exception as e: 
             logger.error(f"Loop Error: {e}")
