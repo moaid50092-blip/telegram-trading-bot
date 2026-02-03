@@ -2,289 +2,894 @@ import os
 import time
 import ccxt
 import pandas as pd
+import numpy as np
 import requests
 import threading
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
-from enum import Enum
-import warnings
+from datetime import datetime, timezone, timedelta
+import json
+from typing import Dict, Optional, List
+from dataclasses import dataclass, asdict, field
 from dotenv import load_dotenv
+import traceback
 
-# تحميل المتغيرات البيئية
+# ==================== تهيئة البيئة ====================
 load_dotenv()
-warnings.filterwarnings('ignore')
 
-# ==================== 1️⃣ TRADING MODE CONFIGURATION ====================
-TRADING_MODE = "DRY"  # غير القيمة إلى "LIVE" للتداول الحقيقي
-
-# ==================== CONFIGURATION ====================
-SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]
-INITIAL_CAPITAL = 1000
-MAX_CAPITAL_PER_TRADE = 0.1
-STOP_LOSS_PERCENT = 0.02
-TAKE_PROFIT_PERCENT = 0.04
-MAX_DAILY_LOSS = 0.05
-
-BREAKEVEN_TRIGGER = 0.012
-TRAILING_ACTIVATION = 0.03
-TRAILING_DISTANCE = 0.01
-
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BINANCE_KEY = os.getenv('BINANCE_API_KEY')
-BINANCE_SECRET = os.getenv('BINANCE_SECRET_KEY')
-
-# ==================== LOGGING SYSTEM ====================
-class UTCFormatter(logging.Formatter):
-    converter = lambda *args: datetime.now(timezone.utc).timetuple()
-
-def setup_logging():
-    log_formatter = UTCFormatter('%(asctime)s - %(levelname)s - %(message)s')
-    main_handler = RotatingFileHandler('trading_bot.log', maxBytes=5*1024*1024, backupCount=5)
-    main_handler.setFormatter(log_formatter)
-    error_handler = RotatingFileHandler('errors.log', maxBytes=2*1024*1024, backupCount=3)
-    error_handler.setFormatter(log_formatter)
-    logger = logging.getLogger('StableBot')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(main_handler)
-    logger.addHandler(error_handler)
-    return logger
-
-logger = setup_logging()
-
-# ==================== ENUMS ====================
-class TradeStatus(Enum):
-    ACTIVE = "ACTIVE"
-    WIN = "WIN"
-    LOSS = "LOSS"
-
-class TradePhase(Enum):
-    PHASE_1_ENTRY = "PHASE_1_ENTRY"
-    PHASE_2_BREAKEVEN = "PHASE_2_BREAKEVEN"
-    PHASE_3_TRAILING = "PHASE_3_TRAILING"
-
-# ==================== CAPITAL MANAGER ====================
-class CapitalManager:
-    def __init__(self, initial_capital):
-        self.current_capital = initial_capital
-        self.available_capital = initial_capital
-        self.daily_loss_limit = initial_capital * MAX_DAILY_LOSS
-        self.daily_loss = 0
-        self.last_reset_date = datetime.now(timezone.utc).date()
-        
-    def reset_daily_stats(self):
-        today = datetime.now(timezone.utc).date()
-        if today > self.last_reset_date:
-            self.daily_loss = 0
-            self.last_reset_date = today
+# ==================== إعدادات التداول ====================
+class TradingConfig:
+    # الأصول المطلوبة
+    SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOT/USDT"]
     
-    def can_open_trade(self, symbol, planned_investment):
-        self.reset_daily_stats()
-        if self.daily_loss >= self.daily_loss_limit: return False, "تجاوز الحد اليومي"
-        if planned_investment > self.available_capital: return False, "رأس مال غير كافي"
-        return True, "موافق"
+    # إدارة رأس المال
+    INITIAL_CAPITAL = float(os.getenv('INITIAL_CAPITAL', 1000))
+    MAX_CAPITAL_PER_TRADE = 0.10  # 10% من رأس المال للصفقة
+    MAX_OPEN_TRADES = 3
+    MIN_CAPITAL_FOR_TRADE = 10  # أقل مبلغ للصفقة
+    
+    # وقف الخسارة وجني الأرباح
+    STOP_LOSS_PERCENT = 0.02  # 2%
+    TAKE_PROFIT_PERCENT = 0.04  # 4%
+    
+    # نظام المراحل
+    BREAKEVEN_TRIGGER = 0.012  # 1.2%
+    TRAILING_ACTIVATION = 0.03  # 3%
+    TRAILING_DISTANCE = 0.01  # 1%
+    
+    # توقيت السوق
+    OPTIMAL_HOURS = list(range(8, 22))  # 8 صباحاً - 10 مساءً UTC
+    AVOID_HOURS = [0, 1, 2, 3, 4, 5]  # 12 صباحاً - 5 صباحاً UTC
+    
+    # إعدادات الأداء
+    MIN_SCORE = 45
+    SCAN_INTERVAL = 180  # 3 دقائق
+    API_RATE_LIMIT_DELAY = 0.5  # تأخير بين طلبات API
+    MAX_RETRIES = 3  # أقصى محاولات للاتصال
+    
+    # التواصل
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-    def update_after_trade(self, trade_result, investment, profit_loss):
-        if trade_result == TradeStatus.WIN:
-            self.current_capital += profit_loss
-            self.available_capital += investment + profit_loss
-        elif trade_result == TradeStatus.LOSS:
-            self.current_capital -= profit_loss
-            self.available_capital += (investment - profit_loss)
-            self.daily_loss += profit_loss
-        logger.info(f"Capital Update: ${self.current_capital:.2f}")
+@dataclass
+class TradeRecord:
+    """سجل الصفقة"""
+    trade_id: str
+    symbol: str
+    entry_price: float
+    entry_time: str
+    quantity: float
+    stop_loss: float
+    take_profit: float
+    phase: str = "ENTRY"
+    status: str = "ACTIVE"
+    highest_price: float = 0.0
+    exit_price: Optional[float] = None
+    exit_time: Optional[str] = None
+    pnl: Optional[float] = None
+    exit_reason: Optional[str] = None
+    score: Optional[float] = None
 
-    def notify(self, message):
-        mode_tag = f"🔴 [LIVE]" if TRADING_MODE == "LIVE" else "🧪 [DRY]"
-        full_msg = f"{mode_tag}\n{message}"
-        if TELEGRAM_TOKEN and CHAT_ID:
-            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", 
-                               json={"chat_id": CHAT_ID, "text": full_msg, "parse_mode": "Markdown"}, timeout=10)
-            except: pass
-
-# ==================== THREE-PHASE TRADE MANAGER ====================
-class ThreePhaseTradeManager:
-    def __init__(self, capital_manager, exchange):
-        self.capital_manager = capital_manager
-        self.exchange = exchange
-        self.active_trades = {}
-        self.trade_counter = 0
-
-    def create_trade(self, symbol, entry_price, quantity, context_score):
-        # تنفيذ شراء حقيقي في وضع LIVE
-        if TRADING_MODE == "LIVE":
-            try:
-                if not BINANCE_KEY or not BINANCE_SECRET:
-                    raise ValueError("مفاتيح API مفقودة!")
-                order = self.exchange.create_market_buy_order(symbol, quantity)
-                entry_price = order.get('price', entry_price)
-                logger.info(f"LIVE BUY EXECUTED: {symbol} at {entry_price}")
-            except Exception as e:
-                logger.error(f"LIVE BUY FAILED: {e}")
-                return None
-
-        trade_id = f"TRADE_{self.trade_counter:04d}"
-        self.trade_counter += 1
-        trade = {
-            'id': trade_id, 'symbol': symbol, 'entry_price': entry_price,
-            'current_stop_loss': entry_price * (1 - STOP_LOSS_PERCENT),
-            'take_profit': entry_price * (1 + TAKE_PROFIT_PERCENT),
-            'quantity': quantity, 'investment': quantity * entry_price,
-            'phase': TradePhase.PHASE_1_ENTRY, 'highest_price': entry_price,
-            'breakeven_price': entry_price * (1 + BREAKEVEN_TRIGGER),
-            'trailing_activation_price': entry_price * (1 + TRAILING_ACTIVATION),
-            'trailing_active': False
+@dataclass
+class CapitalManager:
+    """مدير رأس المال"""
+    initial_capital: float
+    current_capital: float = field(init=False)
+    available_capital: float = field(init=False)
+    invested_capital: float = 0.0
+    daily_pnl: float = 0.0
+    daily_trades: int = 0
+    
+    def __post_init__(self):
+        self.current_capital = self.initial_capital
+        self.available_capital = self.initial_capital
+    
+    def update_capital(self, pnl: float):
+        """تحديث رأس المال بعد صفقة"""
+        self.current_capital += pnl
+        self.available_capital += pnl
+        self.daily_pnl += pnl
+        self.daily_trades += 1
+    
+    def can_open_trade(self, required_amount: float) -> bool:
+        """التحقق من إمكانية فتح صفقة جديدة"""
+        return (self.available_capital >= required_amount and 
+                required_amount >= TradingConfig.MIN_CAPITAL_FOR_TRADE)
+    
+    def get_stats(self) -> Dict:
+        """الحصول على إحصائيات رأس المال"""
+        return {
+            "current_capital": self.current_capital,
+            "available_capital": self.available_capital,
+            "invested_capital": self.invested_capital,
+            "total_return": ((self.current_capital - self.initial_capital) / self.initial_capital) * 100,
+            "daily_pnl": self.daily_pnl,
+            "daily_trades": self.daily_trades
         }
-        self.active_trades[trade_id] = trade
-        self.capital_manager.notify(f"🚀 دخول صفقة: {symbol}\nالسعر: {entry_price:.4f}\nقوة الفرصة: {context_score}")
-        return trade_id
 
-    def manage_trade_phase(self, trade_id, current_price):
-        trade = self.active_trades.get(trade_id)
-        if not trade: return
-        if current_price > trade['highest_price']: trade['highest_price'] = current_price
-        if trade['phase'] == TradePhase.PHASE_1_ENTRY and current_price >= trade['breakeven_price']:
-            trade['current_stop_loss'] = trade['entry_price']
-            trade['phase'] = TradePhase.PHASE_2_BREAKEVEN
-        if trade['phase'] == TradePhase.PHASE_2_BREAKEVEN and current_price >= trade['trailing_activation_price']:
-            trade['trailing_active'] = True
-            trade['phase'] = TradePhase.PHASE_3_TRAILING
-        if trade['trailing_active']:
-            new_stop = trade['highest_price'] * (1 - TRAILING_DISTANCE)
-            if new_stop > trade['current_stop_loss']: trade['current_stop_loss'] = new_stop
+# ==================== نظام السجلات ====================
+class Logger:
+    """مدير السجلات المبسط"""
+    
+    @staticmethod
+    def setup(name: str = "StableBot"):
+        # إنشاء مجلد السجلات
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+        
+        # إعداد السجل
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        
+        # ملف السجلات
+        file_handler = RotatingFileHandler(
+            'logs/trading.log',
+            maxBytes=5*1024*1024,  # 5 MB
+            backupCount=3,
+            encoding='utf-8'
+        )
+        
+        # شكل السجلات
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S UTC'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # سجل وحدة التحكم
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        
+        # إضافة المعالجات
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        
+        return logger
 
-    def check_exit_conditions(self, trade_id, current_price):
-        trade = self.active_trades.get(trade_id)
-        if not trade: return
-        if current_price <= trade['current_stop_loss']:
-            self.execute_exit(trade_id, current_price, TradeStatus.LOSS if current_price < trade['entry_price'] else TradeStatus.WIN, "خروج آمن/تتبع")
-        elif not trade['trailing_active'] and current_price >= trade['take_profit']:
-            self.execute_exit(trade_id, current_price, TradeStatus.WIN, "هدف الربح")
+# ==================== نظام التواصل ====================
+class TelegramNotifier:
+    """مدير إشعارات التلغرام"""
+    
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.last_notification = {}
+    
+    def send_message(self, message: str, msg_type: str = "info"):
+        """إرسال رسالة عبر تلغرام"""
+        if not self.token or not self.chat_id:
+            return False
+        
+        try:
+            # منع التكرار
+            now = time.time()
+            if msg_type in self.last_notification:
+                if now - self.last_notification[msg_type] < 30:  # 30 ثانية
+                    return False
+            
+            url = f"{self.base_url}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                self.last_notification[msg_type] = now
+                return True
+            else:
+                print(f"خطأ تلغرام: {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"خطأ في إرسال تلغرام: {e}")
+            return False
+    
+    def format_trade_entry(self, symbol: str, price: float, quantity: float, score: float) -> str:
+        """تنسيق رسالة دخول صفقة"""
+        return (
+            f"🚀 *دخول صفقة جديدة*\n"
+            f"• العملة: `{symbol}`\n"
+            f"• السعر: `${price:.4f}`\n"
+            f"• الكمية: `{quantity:.4f}`\n"
+            f"• القيمة: `${price * quantity:.2f}`\n"
+            f"• السكور: `{score:.1f}`\n"
+            f"• الوقت: `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`"
+        )
+    
+    def format_trade_exit(self, symbol: str, entry: float, exit: float, quantity: float, 
+                          pnl: float, reason: str) -> str:
+        """تنسيق رسالة خروج صفقة"""
+        pnl_percent = ((exit / entry) - 1) * 100
+        status = "✅" if pnl > 0 else "❌"
+        
+        return (
+            f"{status} *إغلاق صفقة*\n"
+            f"• العملة: `{symbol}`\n"
+            f"• الدخول: `${entry:.4f}`\n"
+            f"• الخروج: `${exit:.4f}`\n"
+            f"• الكمية: `{quantity:.4f}`\n"
+            f"• P&L: `${pnl:.2f}` ({pnl_percent:.2f}%)\n"
+            f"• السبب: `{reason}`\n"
+            f"• الوقت: `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`"
+        )
 
-    def execute_exit(self, trade_id, exit_price, exit_status, reason):
-        trade = self.active_trades.pop(trade_id)
-        # تنفيذ بيع حقيقي في وضع LIVE
-        if TRADING_MODE == "LIVE":
+# ==================== محرك التداول ====================
+class TradingEngine:
+    """محرك التداول الأساسي"""
+    
+    def __init__(self, exchange):
+        self.exchange = exchange
+    
+    def calculate_score(self, df: pd.DataFrame) -> float:
+        """حساب درجة التداول"""
+        try:
+            if len(df) < 30:
+                return 0
+            
+            close = df['close']
+            
+            # 1. كفاءة الحركة (40 نقطة)
+            net_move = abs(close.iloc[-1] - close.iloc[-10])
+            total_path = close.diff().abs().iloc[-10:].sum()
+            efficiency = (net_move / total_path * 40) if total_path > 0 else 0
+            
+            # 2. اتجاه السوق (20 نقطة)
+            sma_20 = close.rolling(20).mean().iloc[-1]
+            trend = 20 if close.iloc[-1] > sma_20 else 5
+            
+            # 3. مؤشر الرفض (خصم 20 نقطة)
+            last_candle = df.iloc[-1]
+            candle_range = last_candle['high'] - last_candle['low']
+            
+            if candle_range > 0:
+                upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
+                upper_wick_ratio = upper_wick / candle_range
+                rejection_penalty = upper_wick_ratio * 30
+            else:
+                rejection_penalty = 0
+            
+            # 4. حجم التداول (10 نقاط)
+            volume_avg = df['vol'].iloc[-10:].mean()
+            volume_current = df['vol'].iloc[-1]
+            volume_score = 10 if volume_current > volume_avg else 5
+            
+            # النتيجة النهائية
+            score = efficiency + trend + volume_score - rejection_penalty
+            return max(0, min(100, score))
+            
+        except Exception as e:
+            print(f"خطأ في حساب السكور: {e}")
+            return 0
+    
+    def fetch_market_data(self, symbol: str, retries: int = 3) -> Optional[pd.DataFrame]:
+        """جلب بيانات السوق مع إعادة المحاولة"""
+        for attempt in range(retries):
             try:
-                self.exchange.create_market_sell_order(trade['symbol'], trade['quantity'])
-                logger.info(f"LIVE SELL EXECUTED: {trade['symbol']}")
+                ohlcv = self.exchange.fetch_ohlcv(
+                    symbol,
+                    timeframe='15m',
+                    limit=35
+                )
+                
+                if not ohlcv or len(ohlcv) < 20:
+                    time.sleep(1)
+                    continue
+                
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                return df
+                
             except Exception as e:
-                logger.error(f"LIVE SELL FAILED: {e}")
+                if attempt < retries - 1:
+                    wait_time = 2 ** attempt  # تأخير متزايد
+                    print(f"محاولة {attempt + 1} فشلت لـ {symbol}: {e}. الانتظار {wait_time} ثانية...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"فشل جلب البيانات لـ {symbol} بعد {retries} محاولات")
+                    return None
+        
+        return None
 
-        pnl = (exit_price - trade['entry_price']) * trade['quantity']
-        self.capital_manager.update_after_trade(exit_status, trade['investment'], abs(pnl))
-        self.capital_manager.notify(f"🏁 خروج: {trade['symbol']}\nالربح/الخسارة: ${pnl:.2f}\nالسبب: {reason}")
-
-# ==================== STABLE TRADING SYSTEM ====================
-class StableTradingSystem:
+# ==================== البوت الرئيسي ====================
+class StableBotPro:
+    """البوت الرئيسي للتداول"""
+    
     def __init__(self):
-        self.exchange = self._init_exchange()
-        self.capital_manager = CapitalManager(INITIAL_CAPITAL)
-        self.trade_manager = ThreePhaseTradeManager(self.capital_manager, self.exchange)
-        self.markets_loaded = False
-        self.load_markets_async()
-
-    def _init_exchange(self):
-        params = {'enableRateLimit': True}
-        if TRADING_MODE == "LIVE" and BINANCE_KEY and BINANCE_SECRET:
-            params.update({'apiKey': BINANCE_KEY, 'secret': BINANCE_SECRET})
-        return ccxt.binance(params)
-
-    def load_markets_async(self):
-        def _load():
-            try: self.exchange.load_markets(); self.markets_loaded = True
-            except: pass
-        threading.Thread(target=_load, daemon=True).start()
-
-    def calculate_context_score(self, df):
+        # التهيئة
+        self.config = TradingConfig
+        self.logger = Logger.setup("StableBotPro")
+        
+        # الأنظمة الفرعية
+        self.exchange = ccxt.binance({'enableRateLimit': True})
+        self.capital_manager = CapitalManager(self.config.INITIAL_CAPITAL)
+        self.trading_engine = TradingEngine(self.exchange)
+        self.notifier = TelegramNotifier(self.config.TELEGRAM_TOKEN, self.config.TELEGRAM_CHAT_ID)
+        
+        # حالة النظام
+        self.active_trades: Dict[str, TradeRecord] = {}
+        self.closed_trades: List[TradeRecord] = []
+        self.system_start_time = datetime.now(timezone.utc)
+        
+        # إنشاء المجلدات
+        self._setup_directories()
+        
+        # تحميل الصفقات المحفوظة
+        self._load_active_trades()
+        
+        self.logger.info(f"بدء StableBotPro برأس مال: ${self.config.INITIAL_CAPITAL}")
+        self.notifier.send_message(
+            f"🚀 *StableBotPro بدأ التشغيل*\n"
+            f"• الرأس المال: `${self.config.INITIAL_CAPITAL:.2f}`\n"
+            f"• الأصول: {len(self.config.SYMBOLS)}\n"
+            f"• الوقت: `{self.system_start_time.strftime('%H:%M UTC')}`"
+        )
+    
+    def _setup_directories(self):
+        """إنشاء المجلدات الضرورية"""
+        directories = [
+            'logs',
+            'data/active_trades',
+            'data/closed_trades',
+            'data/backups'
+        ]
+        
+        for directory in directories:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+                self.logger.info(f"تم إنشاء مجلد: {directory}")
+    
+    def _load_active_trades(self):
+        """تحميل الصفقات النشطة من الملفات"""
         try:
-            if len(df) < 30: return 0
-            net_move = abs(df['close'].iloc[-1] - df['close'].iloc[-10])
-            path = df['close'].diff().abs().iloc[-10:].sum()
-            efficiency = (net_move / path) * 40 if path > 0 else 0
-            atr_s = (df['high'] - df['low']).rolling(5).mean().iloc[-1]
-            atr_l = (df['high'] - df['low']).rolling(20).mean().iloc[-1]
-            vol_ratio = min((atr_s / atr_l), 1.5) * 20 if atr_l > 0 else 0
-            sma20 = df['close'].rolling(20).mean().iloc[-1]
-            dist_score = 20 if df['close'].iloc[-1] > sma20 else 5
-            last = df.iloc[-1]
-            candle_range = last['high'] - last['low']
-            upper_wick = last['high'] - max(last['open'], last['close'])
-            rejection_penalty = (upper_wick / candle_range) * 30 if candle_range > 0 else 0
-            return round(max(min(efficiency + vol_ratio + dist_score - rejection_penalty, 100), 0), 2)
-        except: return 0
-
+            trades_dir = 'data/active_trades'
+            if not os.path.exists(trades_dir):
+                return
+            
+            loaded_count = 0
+            for filename in os.listdir(trades_dir):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(trades_dir, filename)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        
+                        # التحقق من صحة البيانات
+                        if all(key in data for key in ['trade_id', 'symbol', 'entry_price', 'quantity']):
+                            trade = TradeRecord(**data)
+                            self.active_trades[trade.trade_id] = trade
+                            loaded_count += 1
+                        else:
+                            self.logger.warning(f"بيانات تالفة في: {filename}")
+                            
+                    except Exception as e:
+                        self.logger.error(f"خطأ في تحميل {filename}: {e}")
+            
+            self.logger.info(f"تم تحميل {loaded_count} صفقة نشطة")
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في تحميل الصفقات: {e}")
+    
+    def _save_trade(self, trade: TradeRecord):
+        """حفظ الصفقة إلى ملف"""
+        try:
+            filename = f"data/active_trades/{trade.trade_id}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(asdict(trade), f, indent=2, default=str, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"خطأ في حفظ الصفقة {trade.trade_id}: {e}")
+    
+    def _move_to_closed(self, trade: TradeRecord):
+        """نقل الصفقة إلى الأرشيف"""
+        try:
+            # حذف من الملفات النشطة
+            active_file = f"data/active_trades/{trade.trade_id}.json"
+            if os.path.exists(active_file):
+                os.remove(active_file)
+            
+            # حفظ في الأرشيف
+            closed_file = f"data/closed_trades/{trade.trade_id}.json"
+            with open(closed_file, 'w', encoding='utf-8') as f:
+                json.dump(asdict(trade), f, indent=2, default=str, ensure_ascii=False)
+            
+            # إضافة إلى القائمة
+            self.closed_trades.append(trade)
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في نقل الصفقة {trade.trade_id}: {e}")
+    
+    def _is_market_open(self) -> bool:
+        """التحقق من كون السوق مفتوح للتداول"""
+        current_hour = datetime.now(timezone.utc).hour
+        
+        if current_hour in self.config.AVOID_HOURS:
+            return False
+        
+        # يمكن إضافة فحص العطلات أو أحداث السوق هنا
+        return True
+    
+    def evaluate_trade_opportunity(self, symbol: str, df: pd.DataFrame) -> Optional[TradeRecord]:
+        """تقييم فرصة التداول"""
+        try:
+            # حساب النتيجة
+            score = self.trading_engine.calculate_score(df)
+            
+            if score < self.config.MIN_SCORE:
+                return None
+            
+            # التحقق من الشروط
+            current_price = df['close'].iloc[-1]
+            trade_amount = self.capital_manager.current_capital * self.config.MAX_CAPITAL_PER_TRADE
+            
+            if not self.capital_manager.can_open_trade(trade_amount):
+                self.logger.debug(f"رأس المال غير كافي لـ {symbol}")
+                return None
+            
+            # التحقق من عدم وجود صفقة مفتوحة على نفس الأصل
+            if any(trade.symbol == symbol for trade in self.active_trades.values()):
+                self.logger.debug(f"صفقة مفتوحة بالفعل على {symbol}")
+                return None
+            
+            # التحقق من عدد الصفقات المفتوحة
+            if len(self.active_trades) >= self.config.MAX_OPEN_TRADES:
+                self.logger.debug("وصلت إلى الحد الأقصى للصفقات المفتوحة")
+                return None
+            
+            # حساب الكمية
+            quantity = trade_amount / current_price
+            
+            # إنشاء سجل الصفقة
+            trade = TradeRecord(
+                trade_id=f"T-{int(time.time())}-{symbol.replace('/', '-')}",
+                symbol=symbol,
+                entry_price=current_price,
+                entry_time=datetime.now(timezone.utc).isoformat(),
+                quantity=quantity,
+                stop_loss=current_price * (1 - self.config.STOP_LOSS_PERCENT),
+                take_profit=current_price * (1 + self.config.TAKE_PROFIT_PERCENT),
+                highest_price=current_price,
+                score=score
+            )
+            
+            return trade
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في تقييم فرصة {symbol}: {e}")
+            return None
+    
+    def manage_active_trades(self, market_prices: Dict[str, float]):
+        """إدارة الصفقات النشطة"""
+        trades_to_close = []
+        
+        for trade_id, trade in list(self.active_trades.items()):
+            if trade.symbol not in market_prices:
+                continue
+            
+            current_price = market_prices[trade.symbol]
+            
+            # تحديث أعلى سعر
+            if current_price > trade.highest_price:
+                trade.highest_price = current_price
+            
+            # إدارة المراحل
+            self._update_trade_phase(trade, current_price)
+            
+            # التحقق من شروط الخروج
+            exit_reason = self._check_exit_conditions(trade, current_price)
+            
+            if exit_reason:
+                # إعداد بيانات الخروج
+                trade.exit_price = current_price
+                trade.exit_time = datetime.now(timezone.utc).isoformat()
+                trade.exit_reason = exit_reason
+                trade.pnl = (current_price - trade.entry_price) * trade.quantity
+                trade.status = "CLOSED"
+                
+                trades_to_close.append(trade)
+            
+            else:
+                # تحديث الصفقة على القرص
+                self._save_trade(trade)
+        
+        # إغلاق الصفقات المؤهلة
+        for trade in trades_to_close:
+            self.close_trade(trade)
+    
+    def _update_trade_phase(self, trade: TradeRecord, current_price: float):
+        """تحديث مرحلة الصفقة"""
+        # من ENTRY إلى BREAKEVEN
+        if (trade.phase == "ENTRY" and 
+            current_price >= trade.entry_price * (1 + self.config.BREAKEVEN_TRIGGER)):
+            trade.phase = "BREAKEVEN"
+            trade.stop_loss = trade.entry_price
+            self.logger.info(f"{trade.trade_id} انتقل إلى نقطة التعادل")
+        
+        # من BREAKEVEN إلى TRAILING
+        elif (trade.phase == "BREAKEVEN" and 
+              current_price >= trade.entry_price * (1 + self.config.TRAILING_ACTIVATION)):
+            trade.phase = "TRAILING"
+            self.logger.info(f"{trade.trade_id} تفعيل التوقف المتحرك")
+        
+        # تحديث التوقف المتحرك
+        if trade.phase == "TRAILING":
+            new_stop = trade.highest_price * (1 - self.config.TRAILING_DISTANCE)
+            if new_stop > trade.stop_loss:
+                trade.stop_loss = new_stop
+    
+    def _check_exit_conditions(self, trade: TradeRecord, current_price: float) -> Optional[str]:
+        """التحقق من شروط الخروج"""
+        # وقف الخسارة
+        if current_price <= trade.stop_loss:
+            return "STOP_LOSS"
+        
+        # جني الأرباح (في المرحلة الأولى والثانية فقط)
+        if trade.phase in ["ENTRY", "BREAKEVEN"] and current_price >= trade.take_profit:
+            return "TAKE_PROFIT"
+        
+        # كسر التوقف المتحرك
+        if trade.phase == "TRAILING" and current_price <= trade.stop_loss:
+            return "TRAILING_STOP"
+        
+        return None
+    
+    def open_trade(self, trade: TradeRecord):
+        """فتح صفقة جديدة"""
+        try:
+            # تحديث رأس المال
+            trade_value = trade.entry_price * trade.quantity
+            self.capital_manager.available_capital -= trade_value
+            self.capital_manager.invested_capital += trade_value
+            
+            # حفظ الصفقة
+            self.active_trades[trade.trade_id] = trade
+            self._save_trade(trade)
+            
+            # إرسال إشعار
+            message = self.notifier.format_trade_entry(
+                trade.symbol, trade.entry_price, trade.quantity, trade.score
+            )
+            self.notifier.send_message(message, "trade_entry")
+            
+            self.logger.info(f"✅ فتحت صفقة {trade.trade_id} على {trade.symbol}")
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في فتح الصفقة: {e}")
+    
+    def close_trade(self, trade: TradeRecord):
+        """إغلاق صفقة"""
+        try:
+            # تحديث رأس المال
+            self.capital_manager.update_capital(trade.pnl)
+            self.capital_manager.invested_capital -= (trade.entry_price * trade.quantity)
+            
+            # إرسال إشعار
+            message = self.notifier.format_trade_exit(
+                trade.symbol, trade.entry_price, trade.exit_price,
+                trade.quantity, trade.pnl, trade.exit_reason
+            )
+            self.notifier.send_message(message, "trade_exit")
+            
+            # تسجيل النتيجة
+            status_emoji = "✅" if trade.pnl > 0 else "❌"
+            self.logger.info(f"{status_emoji} أغلقت صفقة {trade.trade_id}: ${trade.pnl:.2f}")
+            
+            # نقل إلى الأرشيف
+            self._move_to_closed(trade)
+            
+            # إزالة من الصفقات النشطة
+            if trade.trade_id in self.active_trades:
+                del self.active_trades[trade.trade_id]
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في إغلاق الصفقة {trade.trade_id}: {e}")
+    
     def run_trading_cycle(self):
+        """تشغيل دورة التداول"""
         try:
-            # 2️⃣ إلغاء فلتر التوقيت: النظام يعمل الآن 24/7 بناءً على التحليل فقط
-            current_prices, ohlcv_data = {}, {}
-            for symbol in SYMBOLS:
+            # التحقق من وقت السوق
+            if not self._is_market_open():
+                if not self.active_trades:
+                    self.logger.info("⏸️ وقت سوق غير مناسب - انتظار...")
+                    return
+            
+            # جلب بيانات السوق
+            market_prices = {}
+            for symbol in self.config.SYMBOLS:
                 try:
-                    bars = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=50)
-                    df = pd.DataFrame(bars, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
-                    current_prices[symbol] = df['close'].iloc[-1]
-                    ohlcv_data[symbol] = df
-                except: continue
+                    df = self.trading_engine.fetch_market_data(symbol)
+                    if df is not None and not df.empty:
+                        current_price = df['close'].iloc[-1]
+                        market_prices[symbol] = current_price
+                        
+                        # البحث عن فرص جديدة
+                        if len(self.active_trades) < self.config.MAX_OPEN_TRADES:
+                            trade_opportunity = self.evaluate_trade_opportunity(symbol, df)
+                            if trade_opportunity:
+                                self.open_trade(trade_opportunity)
+                        
+                        # احترام حدود API
+                        time.sleep(self.config.API_RATE_LIMIT_DELAY)
+                        
+                except Exception as e:
+                    self.logger.error(f"خطأ في معالجة {symbol}: {e}")
+                    continue
             
-            for t_id in list(self.trade_manager.active_trades.keys()):
-                price = current_prices.get(self.trade_manager.active_trades[t_id]['symbol'])
-                if price:
-                    self.trade_manager.manage_trade_phase(t_id, price)
-                    self.trade_manager.check_exit_conditions(t_id, price)
+            # إدارة الصفقات النشطة
+            if self.active_trades and market_prices:
+                self.manage_active_trades(market_prices)
             
-            self.entry_scanning(current_prices, ohlcv_data)
-        except Exception as e: logger.error(f"Cycle Error: {e}")
+            # تسجيل حالة النظام (كل 10 دورات)
+            if hasattr(self, '_cycle_count'):
+                self._cycle_count += 1
+                if self._cycle_count % 10 == 0:
+                    self._log_system_status()
+            else:
+                self._cycle_count = 1
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في دورة التداول: {e}")
+            self.notifier.send_message(f"🚨 *خطأ في دورة التداول*\n{str(e)[:200]}", "error")
+    
+    def _log_system_status(self):
+        """تسجيل حالة النظام"""
+        stats = self.capital_manager.get_stats()
+        status = (
+            f"📊 حالة النظام:\n"
+            f"• الرأس المال: ${stats['current_capital']:.2f}\n"
+            f"• الصفقات النشطة: {len(self.active_trades)}\n"
+            f"• P&L اليوم: ${stats['daily_pnl']:.2f}\n"
+            f"• إجمالي العائد: {stats['total_return']:.2f}%"
+        )
+        self.logger.info(status)
 
-    def entry_scanning(self, current_prices, ohlcv_data):
-        if len(self.trade_manager.active_trades) < 3:
-            for symbol, price in current_prices.items():
-                if not any(t['symbol'] == symbol for t in self.trade_manager.active_trades.values()):
-                    score = self.calculate_context_score(ohlcv_data[symbol])
-                    if score < 40: continue
-                    pos_size = self.capital_manager.current_capital * MAX_CAPITAL_PER_TRADE
-                    can, _ = self.capital_manager.can_open_trade(symbol, pos_size)
-                    if can:
-                        self.trade_manager.create_trade(symbol, price, pos_size/price, score)
-                        break
+# ==================== واجهة التحكم بالتلغرام ====================
+class TelegramControl:
+    """واجهة التحكم بالتلغرام"""
+    
+    def __init__(self, bot: StableBotPro):
+        self.bot = bot
+        self.token = TradingConfig.TELEGRAM_TOKEN
+        self.chat_id = TradingConfig.TELEGRAM_CHAT_ID
+        self.commands = {
+            "/status": "عرض حالة النظام",
+            "/trades": "عرض الصفقات النشطة",
+            "/capital": "عرض رأس المال",
+            "/pause": "إيقاف البوت مؤقتاً",
+            "/resume": "استئناف البوت",
+            "/help": "عرض الأوامر المتاحة"
+        }
+        self.is_paused = False
+    
+    def start_listening(self):
+        """بدء الاستماع للأوامر"""
+        if not self.token or not self.chat_id:
+            print("⚠️ إعدادات التلغرام غير مكتملة - تعطيل واجهة التحكم")
+            return
+        
+        print("🚀 بدء واجهة تحكم التلغرام...")
+        
+        offset = 0
+        while True:
+            try:
+                # التحقق من الإيقاف المؤقت
+                if self.is_paused:
+                    time.sleep(5)
+                    continue
+                
+                # جلب التحديثات
+                url = f"https://api.telegram.org/bot{self.token}/getUpdates"
+                params = {"offset": offset, "timeout": 20}
+                
+                response = requests.get(url, params=params, timeout=25)
+                if response.status_code == 200:
+                    updates = response.json().get("result", [])
+                    
+                    for update in updates:
+                        offset = update["update_id"] + 1
+                        
+                        if "message" in update and "text" in update["message"]:
+                            self.handle_command(
+                                update["message"]["chat"]["id"],
+                                update["message"]["text"]
+                            )
+                
+                time.sleep(1)
+                
+            except requests.exceptions.RequestException as e:
+                print(f"📡 خطأ في اتصال التلغرام: {e}")
+                time.sleep(10)
+            except Exception as e:
+                print(f"⚠️ خطأ غير متوقع في التلغرام: {e}")
+                time.sleep(5)
+    
+    def handle_command(self, chat_id: int, command: str):
+        """معالجة الأوامر"""
+        command = command.strip().lower()
+        
+        if command == "/status":
+            self.send_status(chat_id)
+        
+        elif command == "/trades":
+            self.send_active_trades(chat_id)
+        
+        elif command == "/capital":
+            self.send_capital_info(chat_id)
+        
+        elif command == "/pause":
+            self.is_paused = True
+            self.send_message(chat_id, "⏸️ تم إيقاف البوت مؤقتاً")
+        
+        elif command == "/resume":
+            self.is_paused = False
+            self.send_message(chat_id, "▶️ تم استئناف البوت")
+        
+        elif command == "/help":
+            self.send_help(chat_id)
+        
+        elif command.startswith("/"):
+            self.send_message(chat_id, "⚠️ أمر غير معروف. استخدم /help لعرض الأوامر المتاحة.")
+    
+    def send_status(self, chat_id: int):
+        """إرسال حالة النظام"""
+        stats = self.bot.capital_manager.get_stats()
+        uptime = datetime.now(timezone.utc) - self.bot.system_start_time
+        
+        message = (
+            f"📊 *حالة النظام*\n"
+            f"• وقت التشغيل: `{uptime.total_seconds() / 3600:.1f} ساعة`\n"
+            f"• الرأس المال: `${stats['current_capital']:.2f}`\n"
+            f"• المتاح: `${stats['available_capital']:.2f}`\n"
+            f"• الصفقات النشطة: `{len(self.bot.active_trades)}`\n"
+            f"• P&L اليوم: `${stats['daily_pnl']:.2f}`\n"
+            f"• إجمالي العائد: `{stats['total_return']:.2f}%`"
+        )
+        
+        self.send_message(chat_id, message)
+    
+    def send_active_trades(self, chat_id: int):
+        """إرسال الصفقات النشطة"""
+        if not self.bot.active_trades:
+            self.send_message(chat_id, "📭 لا توجد صفقات نشطة حالياً.")
+            return
+        
+        message = "📋 *الصفقات النشطة:*\n\n"
+        for trade in self.bot.active_trades.values():
+            # محاولة الحصول على السعر الحالي
+            try:
+                ticker = self.bot.exchange.fetch_ticker(trade.symbol)
+                current_price = ticker['last']
+                pnl = (current_price - trade.entry_price) * trade.quantity
+                pnl_percent = ((current_price / trade.entry_price) - 1) * 100
+            except:
+                current_price = trade.entry_price
+                pnl = 0
+                pnl_percent = 0
+            
+            message += (
+                f"• `{trade.symbol}`\n"
+                f"  الدخول: `${trade.entry_price:.4f}`\n"
+                f"  الحالي: `${current_price:.4f}`\n"
+                f"  P&L: `${pnl:.2f}` ({pnl_percent:.2f}%)\n"
+                f"  المرحلة: `{trade.phase}`\n"
+                f"  SL: `${trade.stop_loss:.4f}`\n\n"
+            )
+        
+        self.send_message(chat_id, message)
+    
+    def send_capital_info(self, chat_id: int):
+        """إرسال معلومات رأس المال"""
+        stats = self.bot.capital_manager.get_stats()
+        
+        message = (
+            f"💰 *معلومات رأس المال*\n"
+            f"• الابتدائي: `${self.bot.capital_manager.initial_capital:.2f}`\n"
+            f"• الحالي: `${stats['current_capital']:.2f}`\n"
+            f"• المتاح: `${stats['available_capital']:.2f}`\n"
+            f"• المستثمر: `${stats['invested_capital']:.2f}`\n"
+            f"• إجمالي العائد: `{stats['total_return']:.2f}%`\n"
+            f"• الصفقات اليوم: `{stats['daily_trades']}`"
+        )
+        
+        self.send_message(chat_id, message)
+    
+    def send_help(self, chat_id: int):
+        """إرسال قائمة الأوامر"""
+        message = "📋 *قائمة الأوامر:*\n\n"
+        for cmd, desc in self.commands.items():
+            message += f"• `{cmd}` - {desc}\n"
+        
+        self.send_message(chat_id, message)
+    
+    def send_message(self, chat_id: int, text: str):
+        """إرسال رسالة"""
+        try:
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True
+            }
+            requests.post(url, json=payload, timeout=10)
+        except Exception as e:
+            print(f"فشل إرسال رسالة تلغرام: {e}")
 
-# ==================== EXECUTION ====================
+# ==================== التشغيل الرئيسي ====================
+def main():
+    """الدالة الرئيسية"""
+    try:
+        # إنشاء البوت
+        bot = StableBotPro()
+        
+        # بدء واجهة التحكم بالتلغرام في خيط منفصل
+        if TradingConfig.TELEGRAM_TOKEN and TradingConfig.TELEGRAM_CHAT_ID:
+            telegram_control = TelegramControl(bot)
+            telegram_thread = threading.Thread(
+                target=telegram_control.start_listening,
+                daemon=True,
+                name="TelegramControl"
+            )
+            telegram_thread.start()
+            print("✅ واجهة تحكم التلغرام بدأت بنجاح")
+        
+        # حلقة التداول الرئيسية
+        print("🚀 بدء حلقة التداول...")
+        
+        while True:
+            try:
+                # تشغيل دورة التداول
+                bot.run_trading_cycle()
+                
+                # انتظار الفاصل الزمني
+                time.sleep(TradingConfig.SCAN_INTERVAL)
+                
+            except KeyboardInterrupt:
+                print("\n🛑 إيقاف البوت بواسطة المستخدم...")
+                
+                # إرسال تقرير نهائي
+                stats = bot.capital_manager.get_stats()
+                final_msg = (
+                    f"🛑 *تم إيقاف البوت*\n"
+                    f"• الرأس المال النهائي: `${stats['current_capital']:.2f}`\n"
+                    f"• إجمالي العائد: `{stats['total_return']:.2f}%`\n"
+                    f"• الصفقات النشطة: `{len(bot.active_trades)}`\n"
+                    f"• وقت التشغيل: `{((datetime.now(timezone.utc) - bot.system_start_time).total_seconds() / 3600):.1f} ساعة`"
+                )
+                bot.notifier.send_message(final_msg, "system_stop")
+                break
+                
+            except Exception as e:
+                print(f"🚨 خطأ حرج في الحلقة الرئيسية: {e}")
+                bot.logger.critical(f"خطأ حرج: {e}")
+                time.sleep(60)  # انتظار دقيقة قبل إعادة المحاولة
+    
+    except Exception as e:
+        print(f"💥 فشل تشغيل النظام: {e}")
+        traceback.print_exc()
+
 if __name__ == "__main__":
-    bot_system = StableTradingSystem()
-
-    class TelegramInterface:
-        def __init__(self, system):
-            self.system, self.offset = system, 0
-        def start_polling(self):
-            while True:
-                try:
-                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-                    resp = requests.get(url, params={"offset": self.offset, "timeout": 20}, timeout=25).json()
-                    for update in resp.get("result", []):
-                        self.offset = update["update_id"] + 1
-                        if "message" in update: self.handle_command(update["message"]["chat"]["id"], update["message"].get("text", ""))
-                except: time.sleep(10)
-        def handle_command(self, chat_id, text):
-            if not text: return
-            cmd = text.split()[0]
-            if cmd == "/status":
-                msg = f"💰 المحفظة: ${self.system.capital_manager.current_capital:.2f}\n📊 الصفقات: {len(self.system.trade_manager.active_trades)}/3\n⚙️ الوضع: {TRADING_MODE}"
-                self.send(chat_id, msg)
-            elif cmd == "/ping": self.send(chat_id, "🏓 Pong! النظام يعمل 24/7")
-
-        def send(self, chat_id, text):
-            try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text})
-            except: pass
-
-    if TELEGRAM_TOKEN and CHAT_ID:
-        threading.Thread(target=TelegramInterface(bot_system).start_polling, daemon=True).start()
-
-    logger.info(f"Bot started in {TRADING_MODE} mode (No Time Filter).")
-    while True:
-        try:
-            bot_system.run_trading_cycle()
-            time.sleep(180) # دورة كل 3 دقائق
-        except KeyboardInterrupt: break
-        except Exception as e: 
-            logger.error(f"Loop Error: {e}")
-            time.sleep(60)
+    # قائمة المتطلبات
+    requirements = [
+        "ccxt>=4.0.0",
+        "pandas>=2.0.0",
+        "numpy>=1.24.0",
+        "requests>=2.31.0",
+        "python-dotenv>=1.0.0"
+    ]
+    
+    print("=" * 50)
+    print("🚀 StableBot Pro - نظام التداول الآلي المبسط")
+    print("=" * 50)
+    
+    # التحقق من وجود ملف .env
+    if not os.path.exists('.env'):
+        print("⚠️  ملف .env غير موجود!")
+        print("📝 قم بإنشاء ملف .env وأضف:")
+        print("INITIAL_CAPITAL=1000")
+        print("TELEGRAM_TOKEN=your_token_here")
+        print("TELEGRAM_CHAT_ID=your_chat_id_here")
+    
+    # بدء النظام
+    main()
