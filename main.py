@@ -1279,8 +1279,6 @@ class ExecutionManager:
     
     def check_exchange_order_status(self, trade: TradeRecord) -> Optional[str]:
         """فحص حالة أوامر المنصة وإرجاع سبب الخروج إذا تم تنفيذ أي منها"""
-        # إصلاح تقني: أضفت هذه الدالة لأنها مستدعاة في manage_trades لكن غير معرفة سابقًا (AttributeError). 
-        # لا تغيير في المنطق، فقط ضمان التنفيذ بدون فشل.
         if self.exchange.mode != TradingMode.LIVE:
             return None
         
@@ -1755,8 +1753,6 @@ class StableBotPro:
             else:
                 penalty = 0
             
-            # إصلاح تقني: غير 'vol' إلى 'volume' لأن العمود في df هو 'volume' (من fetch_ohlcv)، 
-            # هذا يمنع KeyError runtime error بدون تغيير المنطق.
             volume_avg = df['volume'].iloc[-10:].mean()
             volume_current = df['volume'].iloc[-1]
             volume_score = 10 if volume_current > volume_avg else 5
@@ -2331,8 +2327,6 @@ def main():
         print("📝 الوضع الافتراضي: Paper Trading")
         print("    للتحويل إلى LIVE استخدم: /mode live")
     
-    # إصلاح تقني: غير 'mode=mode' إلى 'trading_mode=mode' لأن __init__ يتوقع 'trading_mode' (TypeError: unexpected keyword argument 'mode').
-    # هذا يمنع فشل التنفيذ بدون تغيير المنطق.
     bot = StableBotPro(trading_mode=mode)
     
     telegram_thread = threading.Thread(target=bot.run, daemon=True)
@@ -2349,25 +2343,11 @@ def main():
     print("  • exit - إيقاف البوت")
     print("=" * 70)
     
-    # استقبال الأوامر من التيرمينال
+    # تعطيل الـ CLI input للتشغيل غير التفاعلي (مثل Railway)
+    # بدلاً من input()، نستخدم حلقة sleep للحفاظ على الـ main thread حيًا دون تفاعل
+    # هذا يمنع EOF error ويسمح للـ bot.run() بالعمل.
     while True:
-        try:
-            cmd = input("\n> ").strip()
-            
-            if cmd.lower() == 'exit':
-                print("🛑 إيقاف البوت...")
-                os._exit(0)
-            
-            if cmd:
-                response = bot.process_external_command(cmd)
-                if response:
-                    print(f"\n{response}")
-        
-        except KeyboardInterrupt:
-            print("\n🛑 إيقاف البوت...")
-            break
-        except Exception as e:
-            print(f"❌ خطأ: {e}")
+        time.sleep(60)  # انتظار دون إدخال يدوي
 
 if __name__ == "__main__":
     main()
