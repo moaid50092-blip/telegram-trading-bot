@@ -827,4 +827,1528 @@ class ExecutionConfig:
     TIMEOUT_SECONDS = 30
     ALLOW_PARTIAL_FILLS = True
     MIN_FILL_PERCENT = 0.8
-    ENABLE_EXCHANGE_ORDERS = True  # تفعيل
+    ENABLE_EXCHANGE_ORDERS = True  # تفعيل أوامر المنصة في وضع LIVE
+
+class EnhancedExchangeInterface:
+    def __init__(self, exchange, config: ExecutionConfig, mode: TradingMode = TradingMode.PAPER):
+        self.exchange = exchange
+        self.config = config
+        self.mode = mode
+        self.logger = logging.getLogger('ExchangeInterface')
+        self.execution_stats = {
+            'total_orders': 0,
+            'successful_orders': 0,
+            'failed_orders': 0,
+            'total_retries': 0,
+            'total_fees': 0.0,
+            'total_slippage': 0.0,
+            'partial_fills': 0,
+            'platform_orders_created': 0,
+            'platform_orders_canceled': 0
+        }
+    
+    def calculate_slippage(self, price: float, side: str) -> float:
+        slippage = price * self.config.SLIPPAGE_PERCENT
+        random_factor = random.uniform(0.8, 1.2)
+        final_slippage = slippage * random_factor
+        max_allowed = price * self.config.MAX_SLIPPAGE
+        return min(final_slippage, max_allowed)
+    
+    def calculate_fee(self, amount: float, price: float, is_maker: bool = False) -> float:
+        fee_rate = self.config.MAKER_FEE if is_maker else self.config.TAKER_FEE
+        value = amount * price
+        return value * fee_rate
+    
+    def format_amount(self, symbol: str, amount: float) -> float:
+        try:
+            market = self.exchange.market(symbol)
+            min_amount = market.get('limits', {}).get('amount', {}).get('min', 0)
+            precision = market.get('precision', {}).get('amount', 8)
+            
+            if amount < min_amount:
+                return 0.0
+            
+            formatted = Decimal(str(amount)).quantize(
+                Decimal('1.' + '0' * precision),
+                rounding=ROUND_HALF_UP
+            )
+            return float(formatted)
+        except:
+            return amount
+    
+    def format_price(self, symbol: str, price: float) -> float:
+        try:
+            market = self.exchange.market(symbol)
+            tick_size = market.get('precision', {}).get('price', 0.0001)
+            formatted = round(price / tick_size) * tick_size
+            return formatted
+        except:
+            return price
+    
+    def create_stop_loss_order(self, symbol: str, amount: float, stop_price: float) -> Optional[str]:
+        """إنشاء أمر وقف خسارة على المنصة (للوضع LIVE فقط)"""
+        if self.mode != TradingMode.LIVE or not self.config.ENABLE_EXCHANGE_ORDERS:
+            return None
+        
+        try:
+            formatted_amount = self.format_amount(symbol, amount)
+            formatted_stop_price = self.format_price(symbol, stop_price)
+            
+            # Binance تستخدم stopPrice و price لنفس القيمة في Stop-Loss-Market
+            params = {
+                'stopPrice': formatted_stop_price,
+                'type': 'STOP_LOSS_LIMIT'  # أو 'STOP_LOSS' حسب ما تدعمه المنصة
+            }
+            
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type='stop_loss_limit',  # أو 'stop_loss'
+                side='sell',
+                amount=formatted_amount,
+                price=formatted_stop_price * 0.99,  # سعر أقل قليلاً لضمان التنفيذ
+                params=params
+            )
+            
+            order_id = order.get('id')
+            if order_id:
+                self.execution_stats['platform_orders_created'] += 1
+                self.logger.info(f"✅ تم إنشاء أمر Stop-Loss على المنصة: {order_id}")
+                return order_id
+            
+        except Exception as e:
+            self.logger.error(f"❌ فشل إنشاء أمر Stop-Loss على المنصة: {e}")
+        
+        return None
+    
+    def create_take_profit_order(self, symbol: str, amount: float, limit_price: float) -> Optional[str]:
+        """إنشاء أمر جني أرباح على المنصة (للوضع LIVE فقط)"""
+        if self.mode != TradingMode.LIVE or not self.config.ENABLE_EXCHANGE_ORDERS:
+            return None
+        
+        try:
+            formatted_amount = self.format_amount(symbol, amount)
+            formatted_limit_price = self.format_price(symbol, limit_price)
+            
+            order = self.exchange.create_limit_sell_order(
+                symbol=symbol,
+                amount=formatted_amount,
+                price=formatted_limit_price
+            )
+            
+            order_id = order.get('id')
+            if order_id:
+                self.execution_stats['platform_orders_created'] += 1
+                self.logger.info(f"✅ تم إنشاء أمر Take-Profit على المنصة: {order_id}")
+                return order_id
+            
+        except Exception as e:
+            self.logger.error(f"❌ فشل إنشاء أمر Take-Profit على المنصة: {e}")
+        
+        return None
+    
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """إلغاء أمر على المنصة"""
+        if self.mode != TradingMode.LIVE:
+            return False
+        
+        try:
+            result = self.exchange.cancel_order(order_id, symbol)
+            if result:
+                self.execution_stats['platform_orders_canceled'] += 1
+                self.logger.info(f"✅ تم إلغاء الأمر على المنصة: {order_id}")
+                return True
+        except Exception as e:
+            self.logger.error(f"❌ فشل إلغاء الأمر {order_id}: {e}")
+        
+        return False
+    
+    def check_order_status(self, symbol: str, order_id: str) -> Optional[Dict]:
+        """فحص حالة أمر على المنصة"""
+        if self.mode != TradingMode.LIVE:
+            return None
+        
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            return {
+                'status': order.get('status'),
+                'filled': order.get('filled', 0),
+                'remaining': order.get('remaining', 0)
+            }
+        except Exception as e:
+            self.logger.error(f"❌ فشل فحص حالة الأمر {order_id}: {e}")
+        
+        return None
+    
+    def execute_market_order(self, symbol: str, side: str, amount: float, max_retries: int = None) -> OrderResult:
+        if max_retries is None:
+            max_retries = self.config.MAX_RETRIES
+        
+        formatted_amount = self.format_amount(symbol, amount)
+        if formatted_amount <= 0:
+            return OrderResult(
+                order_id="", symbol=symbol, order_type=OrderType.MARKET,
+                side=side, amount=amount, price=0.0, filled=0.0,
+                remaining=amount, status=OrderStatus.REJECTED,
+                error="الكمية غير صالحة"
+            )
+        
+        if self.mode == TradingMode.PAPER:
+            return self._simulate_order(symbol, side, formatted_amount, OrderType.MARKET)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                order = self.exchange.create_market_order(symbol, side, formatted_amount)
+                time.sleep(1)
+                
+                order_id = order.get('id', '')
+                if order_id:
+                    order_details = self.exchange.fetch_order(order_id, symbol)
+                else:
+                    order_details = order
+                
+                result = self._parse_order_result(order_details, OrderType.MARKET)
+                result.retry_count = attempt
+                
+                if result.status in [OrderStatus.FILLED, OrderStatus.PARTIAL]:
+                    self.execution_stats['successful_orders'] += 1
+                    return result
+                    
+            except ccxt.NetworkError as e:
+                if attempt < max_retries:
+                    time.sleep(self.config.RETRY_DELAY * (attempt + 1))
+                continue
+            except Exception as e:
+                break
+        
+        self.execution_stats['failed_orders'] += 1
+        return OrderResult(
+            order_id="", symbol=symbol, order_type=OrderType.MARKET,
+            side=side, amount=formatted_amount, price=0.0,
+            filled=0.0, remaining=formatted_amount,
+            status=OrderStatus.REJECTED,
+            error=f"فشل بعد {max_retries + 1} محاولات",
+            retry_count=max_retries
+        )
+    
+    def execute_limit_order(self, symbol: str, side: str, amount: float, price: float, max_retries: int = None) -> OrderResult:
+        if max_retries is None:
+            max_retries = self.config.MAX_RETRIES
+        
+        formatted_amount = self.format_amount(symbol, amount)
+        formatted_price = self.format_price(symbol, price)
+        
+        if formatted_amount <= 0:
+            return OrderResult(
+                order_id="", symbol=symbol, order_type=OrderType.LIMIT,
+                side=side, amount=amount, price=0.0, filled=0.0,
+                remaining=amount, status=OrderStatus.REJECTED,
+                error="الكمية غير صالحة"
+            )
+        
+        if self.mode == TradingMode.PAPER:
+            return self._simulate_order(symbol, side, formatted_amount, OrderType.LIMIT)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                params = {'postOnly': True} if self.config.USE_POST_ONLY else {}
+                order = self.exchange.create_limit_order(
+                    symbol, side, formatted_amount, formatted_price, params
+                )
+                
+                order_id = order.get('id', '')
+                start_time = time.time()
+                
+                while time.time() - start_time < self.config.TIMEOUT_SECONDS:
+                    order_details = self.exchange.fetch_order(order_id, symbol)
+                    status = order_details.get('status', '')
+                    
+                    if status in ['closed', 'filled', 'canceled', 'expired']:
+                        break
+                    
+                    filled = order_details.get('filled', 0)
+                    if filled > 0 and self.config.ALLOW_PARTIAL_FILLS:
+                        fill_percent = filled / formatted_amount
+                        if fill_percent >= self.config.MIN_FILL_PERCENT:
+                            break
+                    
+                    time.sleep(2)
+                
+                result = self._parse_order_result(order_details, OrderType.LIMIT)
+                result.retry_count = attempt
+                
+                if result.status == OrderStatus.PARTIAL:
+                    self.execution_stats['partial_fills'] += 1
+                
+                if result.status in [OrderStatus.FILLED, OrderStatus.PARTIAL]:
+                    self.execution_stats['successful_orders'] += 1
+                    return result
+                else:
+                    try:
+                        self.exchange.cancel_order(order_id, symbol)
+                    except:
+                        pass
+                    return result
+                    
+            except ccxt.NetworkError as e:
+                if attempt < max_retries:
+                    time.sleep(self.config.RETRY_DELAY * (attempt + 1))
+                continue
+            except Exception as e:
+                break
+        
+        self.execution_stats['failed_orders'] += 1
+        return OrderResult(
+            order_id="", symbol=symbol, order_type=OrderType.LIMIT,
+            side=side, amount=formatted_amount, price=formatted_price,
+            filled=0.0, remaining=formatted_amount,
+            status=OrderStatus.REJECTED,
+            error=f"فشل بعد {max_retries + 1} محاولات",
+            retry_count=max_retries
+        )
+    
+    def _simulate_order(self, symbol: str, side: str, amount: float, order_type: OrderType) -> OrderResult:
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            slippage = self.calculate_slippage(current_price, side)
+            
+            if side == 'buy':
+                execution_price = current_price + slippage
+            else:
+                execution_price = current_price - slippage
+            
+            fee = self.calculate_fee(amount, execution_price, is_maker=(order_type == OrderType.LIMIT))
+            
+            return OrderResult(
+                order_id=f"SIM-{int(time.time())}-{random.randint(1000, 9999)}",
+                symbol=symbol,
+                order_type=order_type,
+                side=side,
+                amount=amount,
+                price=execution_price,
+                filled=amount,
+                remaining=0.0,
+                status=OrderStatus.FILLED,
+                average_price=execution_price,
+                cost=amount * execution_price,
+                fee=fee,
+                fee_currency='USDT',
+                is_simulated=True
+            )
+        except Exception as e:
+            return OrderResult(
+                order_id="", symbol=symbol, order_type=order_type,
+                side=side, amount=amount, price=0.0, filled=0.0,
+                remaining=amount, status=OrderStatus.REJECTED,
+                error=str(e), is_simulated=True
+            )
+    
+    def _parse_order_result(self, order_data: Dict, order_type: OrderType) -> OrderResult:
+        try:
+            ccxt_status = order_data.get('status', '')
+            filled = float(order_data.get('filled', 0))
+            amount = float(order_data.get('amount', 0))
+            
+            if filled >= amount:
+                status = OrderStatus.FILLED
+            elif filled > 0:
+                status = OrderStatus.PARTIAL
+            else:
+                status_map = {
+                    'open': OrderStatus.OPEN,
+                    'closed': OrderStatus.CLOSED,
+                    'canceled': OrderStatus.CANCELED,
+                    'expired': OrderStatus.EXPIRED,
+                    'rejected': OrderStatus.REJECTED
+                }
+                status = status_map.get(ccxt_status, OrderStatus.PENDING)
+            
+            average_price = 0.0
+            if filled > 0:
+                cost = float(order_data.get('cost', 0))
+                average_price = cost / filled if cost > 0 else float(order_data.get('price', 0))
+            
+            fee_data = order_data.get('fee', {})
+            if isinstance(fee_data, dict):
+                fee = fee_data.get('cost', 0)
+                fee_currency = fee_data.get('currency', '')
+            else:
+                fee = fee_data if fee_data else 0
+                fee_currency = ''
+            
+            self.execution_stats['total_fees'] += fee
+            
+            return OrderResult(
+                order_id=str(order_data.get('id', '')),
+                symbol=order_data.get('symbol', ''),
+                order_type=order_type,
+                side=order_data.get('side', ''),
+                amount=amount,
+                price=float(order_data.get('price', 0)),
+                filled=filled,
+                remaining=amount - filled,
+                status=status,
+                average_price=average_price,
+                cost=float(order_data.get('cost', 0)),
+                fee=fee,
+                fee_currency=fee_currency,
+                timestamp=order_data.get('timestamp', datetime.now(timezone.utc).isoformat())
+            )
+        except Exception as e:
+            raise
+    
+    def get_execution_stats(self) -> Dict:
+        return self.execution_stats.copy()
+
+class ExecutionManager:
+    def __init__(self, exchange_interface: EnhancedExchangeInterface):
+        self.exchange = exchange_interface
+        self.config = exchange_interface.config
+        self.logger = logging.getLogger('ExecutionManager')
+        self.trade_executions: Dict[str, TradeExecution] = {}
+    
+    def create_exchange_orders(self, trade: TradeRecord) -> Tuple[bool, str]:
+        """إنشاء أوامر Stop-Loss و Take-Profit على المنصة (للصفقات الجديدة)"""
+        if self.exchange.mode != TradingMode.LIVE:
+            return True, "وضع المحاكاة - لا حاجة لأوامر المنصة"
+        
+        try:
+            # إنشاء أمر Stop-Loss على المنصة
+            if trade.stop_loss and not trade.stop_loss_order_id:
+                stop_order_id = self.exchange.create_stop_loss_order(
+                    trade.symbol, trade.quantity, trade.stop_loss
+                )
+                if stop_order_id:
+                    trade.stop_loss_order_id = stop_order_id
+                    self.logger.info(f"✅ تم إنشاء أمر Stop-Loss على المنصة للصفقة {trade.trade_id}")
+                else:
+                    self.logger.warning(f"⚠️ فشل إنشاء أمر Stop-Loss على المنصة للصفقة {trade.trade_id}")
+            
+            # إنشاء أمر Take-Profit على المنصة (إذا كان موجوداً)
+            if trade.take_profit and not trade.take_profit_order_id:
+                tp_order_id = self.exchange.create_take_profit_order(
+                    trade.symbol, trade.quantity, trade.take_profit
+                )
+                if tp_order_id:
+                    trade.take_profit_order_id = tp_order_id
+                    self.logger.info(f"✅ تم إنشاء أمر Take-Profit على المنصة للصفقة {trade.trade_id}")
+                else:
+                    self.logger.warning(f"⚠️ فشل إنشاء أمر Take-Profit على المنصة للصفقة {trade.trade_id}")
+            
+            return True, "تم إنشاء أوامر المنصة"
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def update_exchange_orders(self, trade: TradeRecord) -> Tuple[bool, str]:
+        """تحديث أوامر المنصة (في حالة التوقف المتحرك)"""
+        if self.exchange.mode != TradingMode.LIVE:
+            return True, "وضع المحاكاة - لا حاجة لتحديث أوامر المنصة"
+        
+        try:
+            updated = False
+            
+            # تحديث أمر Stop-Loss إذا تغير
+            if trade.stop_loss_modified and trade.stop_loss_order_id:
+                # إلغاء الأمر القديم وإنشاء جديد
+                self.exchange.cancel_order(trade.symbol, trade.stop_loss_order_id)
+                
+                new_stop_order_id = self.exchange.create_stop_loss_order(
+                    trade.symbol, trade.quantity, trade.stop_loss
+                )
+                
+                if new_stop_order_id:
+                    trade.stop_loss_order_id = new_stop_order_id
+                    trade.stop_loss_modified = False
+                    updated = True
+                    self.logger.info(f"🔄 تم تحديث أمر Stop-Loss على المنصة للصفقة {trade.trade_id}")
+            
+            # تحديث أمر Take-Profit إذا تم إلغاؤه (في حالة التوقف المتحرك)
+            if trade.take_profit is None and trade.take_profit_order_id:
+                self.exchange.cancel_order(trade.symbol, trade.take_profit_order_id)
+                trade.take_profit_order_id = None
+                trade.take_profit_modified = False
+                updated = True
+                self.logger.info(f"🔄 تم إلغاء أمر Take-Profit على المنصة للصفقة {trade.trade_id}")
+            
+            return True, "تم تحديث أوامر المنصة" if updated else "لا حاجة للتحديث"
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def check_exchange_order_status(self, trade: TradeRecord) -> Optional[str]:
+        """فحص حالة أوامر المنصة وإرجاع سبب الخروج إذا تم تنفيذ أي منها"""
+        if self.exchange.mode != TradingMode.LIVE:
+            return None
+        
+        try:
+            # فحص أمر Stop-Loss
+            if trade.stop_loss_order_id:
+                status = self.exchange.check_order_status(trade.symbol, trade.stop_loss_order_id)
+                if status and status.get('status') in ['filled', 'closed']:
+                    return "STOP_LOSS (منصة)"
+            
+            # فحص أمر Take-Profit
+            if trade.take_profit_order_id:
+                status = self.exchange.check_order_status(trade.symbol, trade.take_profit_order_id)
+                if status and status.get('status') in ['filled', 'closed']:
+                    return "TAKE_PROFIT (منصة)"
+        
+        except Exception as e:
+            self.logger.error(f"خطأ في فحص حالة أوامر المنصة: {e}")
+        
+        return None
+    
+    def cleanup_exchange_orders(self, trade: TradeRecord) -> bool:
+        """تنظيف أوامر المنصة عند إغلاق الصفقة"""
+        if self.exchange.mode != TradingMode.LIVE:
+            return True
+        
+        try:
+            success = True
+            
+            if trade.stop_loss_order_id:
+                if not self.exchange.cancel_order(trade.symbol, trade.stop_loss_order_id):
+                    success = False
+            
+            if trade.take_profit_order_id:
+                if not self.exchange.cancel_order(trade.symbol, trade.take_profit_order_id):
+                    success = False
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في تنظيف أوامر المنصة: {e}")
+            return False
+    
+    def execute_entry(self, symbol: str, amount: float, price: float = None, order_type: OrderType = None) -> Tuple[Optional[TradeExecution], Optional[str]]:
+        try:
+            trade_id = f"TRD-{int(time.time())}-{random.randint(1000, 9999)}"
+            
+            if order_type is None:
+                order_type = self.config.DEFAULT_ORDER_TYPE
+            
+            if order_type == OrderType.MARKET:
+                order_result = self.exchange.execute_market_order(symbol, 'buy', amount)
+            else:
+                if price is None:
+                    ticker = self.exchange.exchange.fetch_ticker(symbol)
+                    price = ticker['last']
+                order_result = self.exchange.execute_limit_order(symbol, 'buy', amount, price)
+            
+            if order_result.status in [OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED]:
+                return None, order_result.error or f"فشل تنفيذ الأمر: {order_result.status.value}"
+            
+            slippage = 0.0
+            if order_result.average_price and order_result.price:
+                slippage = abs(order_result.average_price - order_result.price)
+                self.exchange.execution_stats['total_slippage'] += slippage
+            
+            net_price = order_result.average_price or order_result.price
+            if net_price > 0 and order_result.filled > 0:
+                fee_per_unit = order_result.fee / order_result.filled if order_result.fee else 0
+                net_price += fee_per_unit
+            
+            execution = TradeExecution(
+                trade_id=trade_id,
+                symbol=symbol,
+                entry_order=order_result,
+                entry_fee=order_result.fee or 0,
+                slippage_entry=slippage,
+                net_price_entry=net_price,
+                total_fees=order_result.fee or 0
+            )
+            
+            self.trade_executions[trade_id] = execution
+            return execution, None
+            
+        except Exception as e:
+            return None, str(e)
+    
+    def execute_exit(self, symbol: str, amount: float, trade_id: str = None, price: float = None, order_type: OrderType = None) -> Tuple[Optional[TradeExecution], Optional[str]]:
+        try:
+            execution = None
+            if trade_id and trade_id in self.trade_executions:
+                execution = self.trade_executions[trade_id]
+                symbol = execution.symbol
+                amount = execution.entry_order.filled
+            
+            if order_type is None:
+                order_type = self.config.DEFAULT_ORDER_TYPE
+            
+            if order_type == OrderType.MARKET:
+                order_result = self.exchange.execute_market_order(symbol, 'sell', amount)
+            else:
+                if price is None:
+                    ticker = self.exchange.exchange.fetch_ticker(symbol)
+                    price = ticker['last']
+                order_result = self.exchange.execute_limit_order(symbol, 'sell', amount, price)
+            
+            if order_result.status in [OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED]:
+                if order_type == OrderType.LIMIT:
+                    order_result = self.exchange.execute_market_order(symbol, 'sell', amount)
+                    if order_result.status in [OrderStatus.REJECTED, OrderStatus.CANCELED]:
+                        return None, "فشل الخروج"
+            
+            slippage = 0.0
+            if order_result.average_price and order_result.price:
+                slippage = abs(order_result.average_price - order_result.price)
+                self.exchange.execution_stats['total_slippage'] += slippage
+            
+            net_price = order_result.average_price or order_result.price
+            if net_price > 0 and order_result.filled > 0:
+                fee_per_unit = order_result.fee / order_result.filled if order_result.fee else 0
+                net_price -= fee_per_unit
+            
+            if execution:
+                execution.exit_order = order_result
+                execution.exit_fee = order_result.fee or 0
+                execution.slippage_exit = slippage
+                execution.net_price_exit = net_price
+                execution.total_fees += (order_result.fee or 0)
+                
+                if execution.net_price_entry > 0 and net_price > 0:
+                    execution.net_pnl = (net_price - execution.net_price_entry) * order_result.filled
+                
+                return execution, None
+            else:
+                execution = TradeExecution(
+                    trade_id=trade_id or f"EXIT-{int(time.time())}",
+                    symbol=symbol,
+                    entry_order=None,
+                    exit_order=order_result,
+                    exit_fee=order_result.fee or 0,
+                    slippage_exit=slippage,
+                    net_price_exit=net_price,
+                    total_fees=order_result.fee or 0
+                )
+                
+                self.trade_executions[execution.trade_id] = execution
+                return execution, None
+            
+        except Exception as e:
+            return None, str(e)
+
+# ==================== نظام المراقبة ====================
+class Monitor:
+    def __init__(self, bot):
+        self.bot = bot
+        self.logger = logging.getLogger('Monitor')
+        self.daily_stats = {
+            'date': datetime.now(timezone.utc).date(),
+            'trades_opened': 0,
+            'trades_closed': 0,
+            'total_pnl': 0.0,
+            'total_fees': 0.0,
+            'total_slippage': 0.0,
+            'execution_success': 0,
+            'execution_failed': 0,
+            'platform_orders_created': 0,
+            'platform_orders_canceled': 0
+        }
+    
+    def update_stats(self, trade: TradeRecord, execution: TradeExecution = None):
+        if trade.status == "ACTIVE":
+            self.daily_stats['trades_opened'] += 1
+        elif trade.status == "CLOSED":
+            self.daily_stats['trades_closed'] += 1
+            if trade.pnl:
+                self.daily_stats['total_pnl'] += trade.pnl
+        
+        if execution:
+            self.daily_stats['total_fees'] += execution.total_fees
+            self.daily_stats['total_slippage'] += (execution.slippage_entry + execution.slippage_exit)
+    
+    def update_platform_stats(self, stats: Dict):
+        self.daily_stats['platform_orders_created'] = stats.get('platform_orders_created', 0)
+        self.daily_stats['platform_orders_canceled'] = stats.get('platform_orders_canceled', 0)
+    
+    def generate_daily_report(self) -> str:
+        today = datetime.now(timezone.utc).date()
+        
+        if today > self.daily_stats['date']:
+            self._save_report()
+            self.daily_stats = {
+                'date': today,
+                'trades_opened': 0,
+                'trades_closed': 0,
+                'total_pnl': 0.0,
+                'total_fees': 0.0,
+                'total_slippage': 0.0,
+                'execution_success': 0,
+                'execution_failed': 0,
+                'platform_orders_created': 0,
+                'platform_orders_canceled': 0
+            }
+        
+        total_executions = self.daily_stats['execution_success'] + self.daily_stats['execution_failed']
+        success_rate = (self.daily_stats['execution_success'] / total_executions * 100) if total_executions > 0 else 0
+        
+        avg_slippage = 0
+        if self.daily_stats['trades_closed'] > 0:
+            avg_slippage = self.daily_stats['total_slippage'] / (self.daily_stats['trades_closed'] * 2)
+        
+        avg_fees = 0
+        if self.daily_stats['trades_closed'] > 0:
+            avg_fees = self.daily_stats['total_fees'] / self.daily_stats['trades_closed']
+        
+        report = f"""
+📅 تقرير يومي - {today}
+══════════════════════════
+📊 الصفقات:
+• المفتوحة: {self.daily_stats['trades_opened']}
+• المغلقة: {self.daily_stats['trades_closed']}
+• P&L اليوم: ${self.daily_stats['total_pnl']:.2f}
+
+🎯 التنفيذ:
+• معدل النجاح: {success_rate:.1f}%
+• متوسط الانزلاق: {avg_slippage:.4f}%
+• متوسط الرسوم: ${avg_fees:.4f}
+• أوامر المنصة: {self.daily_stats['platform_orders_created']}
+
+💰 رأس المال:
+• الحالي: ${self.bot.current_capital:.2f}
+• المتاح: ${self.bot.available_capital:.2f}
+• الخسارة الكلية: {self.bot.total_drawdown_percent:.1f}%
+══════════════════════════
+        """
+        
+        return report
+    
+    def _save_report(self):
+        if not os.path.exists('reports'):
+            os.makedirs('reports')
+        
+        filename = f"reports/report_{self.daily_stats['date']}.json"
+        with open(filename, 'w') as f:
+            json.dump(self.daily_stats, f, indent=2)
+
+# ==================== البوت الرئيسي ====================
+class StableBotPro:
+    def __init__(self, trading_mode: TradingMode = TradingMode.PAPER):
+        self.config = TradingConfig
+        self.trading_mode = trading_mode
+        
+        exchange_params = {
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'}
+        }
+        
+        if trading_mode == TradingMode.LIVE:
+            exchange_params.update({
+                'apiKey': os.getenv('BINANCE_API_KEY'),
+                'secret': os.getenv('BINANCE_API_SECRET')
+            })
+        
+        self.exchange = ccxt.binance(exchange_params)
+        
+        self.execution_config = ExecutionConfig()
+        self.exchange_interface = EnhancedExchangeInterface(
+            self.exchange, self.execution_config, trading_mode
+        )
+        self.execution_manager = ExecutionManager(self.exchange_interface)
+        self.monitor = Monitor(self)
+        
+        self.active_trades: Dict[str, TradeRecord] = {}
+        self.lock = threading.Lock()
+        self.daily_pnl = 0.0
+        self.current_capital = self.config.INITIAL_CAPITAL
+        self.available_capital = self.config.INITIAL_CAPITAL
+        self.total_drawdown_percent = 0.0
+        self.initial_capital_snapshot = self.config.INITIAL_CAPITAL
+        self.last_reset_date = datetime.now(timezone.utc).date()
+        
+        self.market_filter = MarketFilter(self.config)
+        self.correlation_filter = CorrelationFilter(self.config)
+        self.risk_manager = DynamicRiskManager(self.config)
+        
+        # الفلاتر الجديدة
+        self.bear_market_filter = BearMarketFilter(self.config)
+        self.ethical_filter = EthicalFilter(self.config)
+        
+        # نظام إدارة الوضع
+        self.mode_manager = ModeManager(self)
+        self.command_handler = TelegramCommandHandler(self)
+        
+        for path in ['logs', 'data/active_trades', 'data/closed_trades', 'data/executions', 'reports']:
+            if not os.path.exists(path):
+                os.makedirs(path)
+        
+        self.logger = Logger.setup('StableBot')
+        self._load_active_trades()
+        
+        self.logger.info(f"🚀 بدء StableBotPro v4.0 - وضع: {trading_mode.value}")
+        
+        if trading_mode == TradingMode.LIVE:
+            self.logger.warning("⚠️  وضع التداول الحي مفعّل!")
+            # مزامنة الرصيد من المنصة
+            success, msg = self._sync_live_balance()
+            if not success:
+                self.logger.error(f"❌ فشل مزامنة الرصيد: {msg}")
+            else:
+                self.logger.info(f"✅ تم مزامنة الرصيد من المنصة: ${self.available_capital:.2f}")
+        
+        self.logger.info(f"✅ تم تحميل الفلاتر الجديدة:")
+        self.logger.info(f"   • Bear Market Filter: {'مفعل' if self.bear_market_filter.enabled else 'معطل'}")
+        self.logger.info(f"   • Ethical Filter: {'مفعل' if self.ethical_filter.enabled else 'معطل'}")
+        self.logger.info(f"   • Mode Manager: جاهز")
+        self.logger.info(f"   • Max Total Drawdown: {self.config.MAX_TOTAL_DRAWDOWN*100:.1f}%")
+    
+    def _sync_live_balance(self) -> Tuple[bool, str]:
+        """مزامنة الرصيد من المنصة الحقيقية"""
+        if self.trading_mode != TradingMode.LIVE:
+            return True, "وضع المحاكاة - لا حاجة للمزامنة"
+        
+        try:
+            with self.lock:
+                balance = self.exchange.fetch_balance()
+                usdt_balance = balance.get('USDT', {})
+                free_balance = usdt_balance.get('free', 0)
+                total_balance = usdt_balance.get('total', 0)
+                
+                if free_balance <= 0:
+                    return False, "الرصيد المتاح غير صالح أو صفري"
+                
+                # تحديث الرصيد المتاح
+                self.available_capital = free_balance
+                self.current_capital = total_balance
+                self.initial_capital_snapshot = total_balance
+                
+                self.logger.info(f"💰 تم مزامنة الرصيد: ${free_balance:.2f} متاح، ${total_balance:.2f} إجمالي")
+                return True, f"تم المزامنة: ${free_balance:.2f}"
+                
+        except Exception as e:
+            return False, f"خطأ في مزامنة الرصيد: {str(e)}"
+    
+    def _update_live_balance(self) -> bool:
+        """تحديث الرصيد من المنصة في كل دورة (للوضع LIVE فقط)"""
+        if self.trading_mode != TradingMode.LIVE:
+            return True
+        
+        try:
+            balance = self.exchange.fetch_balance()
+            usdt_balance = balance.get('USDT', {})
+            free_balance = usdt_balance.get('free', 0)
+            
+            with self.lock:
+                self.available_capital = free_balance
+                
+                # تحديث الخسارة الكلية
+                if self.initial_capital_snapshot > 0:
+                    self.total_drawdown_percent = ((self.initial_capital_snapshot - self.current_capital) / 
+                                                  self.initial_capital_snapshot * 100)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في تحديث الرصيد: {e}")
+            return False
+    
+    def _check_total_drawdown(self) -> bool:
+        """فحص الخسارة الكلية مقابل الحد الأقصى"""
+        max_drawdown = self.config.MAX_TOTAL_DRAWDOWN * 100
+        
+        if self.total_drawdown_percent >= max_drawdown:
+            self.logger.critical(f"🚨 تم تجاوز الحد الأقصى للخسارة الكلية: {self.total_drawdown_percent:.1f}% >= {max_drawdown:.1f}%")
+            self._send_notification(
+                f"🚨 *توقف النظام - تجاوز الحد الأقصى للخسارة*\n"
+                f"• الخسارة الحالية: `{self.total_drawdown_percent:.1f}%`\n"
+                f"• الحد الأقصى: `{max_drawdown:.1f}%`\n"
+                f"• تم إيقاف جميع التداولات الجديدة"
+            )
+            return False
+        
+        elif self.total_drawdown_percent >= max_drawdown * 0.8:
+            self.logger.warning(f"⚠️  اقتراب من الحد الأقصى للخسارة: {self.total_drawdown_percent:.1f}%")
+        
+        return True
+    
+    def _load_active_trades(self):
+        path = 'data/active_trades'
+        if not os.path.exists(path):
+            return
+        
+        loaded = 0
+        for filename in os.listdir(path):
+            if filename.endswith('.json'):
+                try:
+                    with open(f"{path}/{filename}", 'r') as f:
+                        data = json.load(f)
+                        if data.get('take_profit') == 'inf' or data.get('take_profit') is None:
+                            data['take_profit'] = None
+                        trade = TradeRecord(**data)
+                        self.active_trades[trade.trade_id] = trade
+                        loaded += 1
+                except Exception as e:
+                    self.logger.error(f"خطأ في تحميل {filename}: {e}")
+        
+        self.logger.info(f"تم تحميل {loaded} صفقة من الذاكرة")
+    
+    def _save_trade(self, trade: TradeRecord):
+        try:
+            filename = f"data/active_trades/{trade.trade_id}.json"
+            trade_dict = asdict(trade)
+            if trade_dict['take_profit'] is None:
+                trade_dict['take_profit'] = None
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(trade_dict, f, indent=2, default=str, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"خطأ في حفظ الصفقة: {e}")
+    
+    def _save_execution(self, execution: TradeExecution):
+        try:
+            filename = f"data/executions/{execution.trade_id}.json"
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(asdict(execution), f, indent=2, default=str, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"خطأ في حفظ سجل التنفيذ: {e}")
+    
+    def _move_to_closed(self, trade_id: str):
+        try:
+            src = f"data/active_trades/{trade_id}.json"
+            dst = f"data/closed_trades/{trade_id}.json"
+            if os.path.exists(src):
+                os.rename(src, dst)
+        except Exception as e:
+            self.logger.error(f"خطأ في نقل الصفقة: {e}")
+    
+    def _send_notification(self, message: str):
+        if not self.config.TELEGRAM_TOKEN or not self.config.TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.config.TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": self.config.TELEGRAM_CHAT_ID,
+                "text": f"🤖 *StableBot v4:*\n{message}",
+                "parse_mode": "Markdown"
+            }
+            requests.post(url, json=payload, timeout=10)
+        except Exception as e:
+            self.logger.error(f"خطأ تلغرام: {e}")
+    
+    # ==================== محرك التداول الأساسي ====================
+    def calculate_score(self, df: pd.DataFrame) -> float:
+        try:
+            if len(df) < 30:
+                return 0
+            
+            close = df['close']
+            
+            net_move = abs(close.iloc[-1] - close.iloc[-10])
+            total_path = close.diff().abs().iloc[-10:].sum()
+            efficiency = (net_move / total_path * 40) if total_path > 0 else 0
+            
+            sma_20 = close.rolling(20).mean().iloc[-1]
+            trend = 20 if close.iloc[-1] > sma_20 else 5
+            
+            last_candle = df.iloc[-1]
+            candle_range = last_candle['high'] - last_candle['low']
+            
+            if candle_range > 0:
+                upper_wick = last_candle['high'] - max(last_candle['open'], last_candle['close'])
+                upper_wick_ratio = upper_wick / candle_range
+                penalty = upper_wick_ratio * 30
+            else:
+                penalty = 0
+            
+            volume_avg = df['volume'].iloc[-10:].mean()
+            volume_current = df['volume'].iloc[-1]
+            volume_score = 10 if volume_current > volume_avg else 5
+            
+            score = efficiency + trend + volume_score - penalty
+            return max(0, min(100, round(score, 2)))
+            
+        except Exception as e:
+            self.logger.error(f"خطأ في حساب السكور: {e}")
+            return 0
+    
+    def scan_symbols(self) -> Dict[str, MarketAnalysis]:
+        scan_results = {}
+        
+        for symbol in self.config.SYMBOLS[:20]:
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(symbol, '15m', limit=100)
+                if len(ohlcv) < 50:
+                    continue
+                
+                df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+                
+                score = self.calculate_score(df)
+                
+                is_tradable, market_analysis = self.market_filter.analyze_market_regime(df)
+                
+                analysis = MarketAnalysis(
+                    symbol=symbol,
+                    score=score,
+                    price=df['close'].iloc[-1],
+                    atr_percent=market_analysis.get('atr_percent', 0),
+                    ema_slope=market_analysis.get('ema_slope', 0),
+                    is_sideways=market_analysis.get('is_sideways', False),
+                    correlation_group=self.correlation_filter.get_symbol_group(symbol),
+                    last_ohlcv=df
+                )
+                
+                scan_results[symbol] = analysis
+                
+                time.sleep(self.config.API_DELAY)
+                
+            except Exception as e:
+                self.logger.error(f"خطأ في مسح {symbol}: {e}")
+                continue
+        
+        self.logger.info(f"✅ تم مسح {len(scan_results)} عملة")
+        return scan_results
+    
+    def filter_symbols(self, scan_results: Dict[str, MarketAnalysis]) -> Dict[str, MarketAnalysis]:
+        filtered_results = {}
+        
+        for symbol, analysis in scan_results.items():
+            if analysis.score < self.config.MIN_SCORE:
+                continue
+            
+            if analysis.is_sideways:
+                continue
+            
+            if analysis.atr_percent < self.config.MIN_ATR_PERCENT:
+                continue
+            
+            can_trade, reason = self.correlation_filter.can_trade_symbol(symbol, self.active_trades)
+            if not can_trade:
+                continue
+            
+            risk_params = self.risk_manager.get_risk_parameters(analysis.score)
+            if not risk_params.get('can_trade', False):
+                continue
+            
+            filtered_results[symbol] = analysis
+        
+        self.logger.info(f"✅ بقي بعد الفلترة {len(filtered_results)} عملة")
+        return filtered_results
+    
+    def rank_symbols(self, filtered_results: Dict[str, MarketAnalysis]) -> List[Tuple[str, MarketAnalysis]]:
+        ranking_list = []
+        
+        for symbol, analysis in filtered_results.items():
+            ranking_score = analysis.score + (analysis.atr_percent * 100)
+            ranking_list.append((symbol, analysis, ranking_score))
+        
+        ranked_items = sorted(
+            ranking_list,
+            key=lambda x: (x[2], x[1].atr_percent),
+            reverse=True
+        )
+        
+        ranked_symbols = []
+        for i, (symbol, analysis, _) in enumerate(ranked_items):
+            analysis.ranking = i + 1
+            ranked_symbols.append((symbol, analysis))
+        
+        if ranked_symbols:
+            top_3 = ranked_symbols[:3]
+            self.logger.info(f"📊 أفضل 3 عملات:")
+            for symbol, analysis in top_3:
+                self.logger.info(f"  #{analysis.ranking} {symbol}: Score={analysis.score:.1f}, ATR%={analysis.atr_percent:.4f}")
+        
+        return ranked_symbols
+    
+    def _can_open_trade(self) -> bool:
+        with self.lock:
+            # فحص الخسارة الكلية
+            if not self._check_total_drawdown():
+                return False
+            
+            if len(self.active_trades) >= self.config.MAX_OPEN_TRADES:
+                return False
+            
+            trade_amount = self.current_capital * self.config.MAX_CAPITAL_PER_TRADE
+            if trade_amount > self.available_capital:
+                return False
+            
+            daily_limit = self.config.INITIAL_CAPITAL * self.config.MAX_DAILY_LOSS
+            if self.daily_pnl < -daily_limit:
+                return False
+            
+            return True
+    
+    def execute_trades(self, ranked_symbols: List[Tuple[str, MarketAnalysis]]):
+        with self.lock:
+            current_trades_count = len(self.active_trades)
+            available_slots = self.config.MAX_OPEN_TRADES - current_trades_count
+            
+            if available_slots <= 0:
+                return
+            
+            trades_opened = 0
+            
+            for symbol, analysis in ranked_symbols:
+                if trades_opened >= available_slots:
+                    break
+                
+                if any(t.symbol == symbol for t in self.active_trades.values()):
+                    continue
+                
+                if self._open_trade_with_execution(symbol, analysis.price, analysis.score, analysis):
+                    trades_opened += 1
+        
+        if trades_opened > 0:
+            self.logger.info(f"✅ تم فتح {trades_opened}/{available_slots} صفقة جديدة")
+    
+    def _open_trade_with_execution(self, symbol: str, price: float, score: float, analysis=None) -> bool:
+        if not self._can_open_trade():
+            return False
+        
+        try:
+            with self.lock:
+                risk_params = self.risk_manager.get_risk_parameters(score)
+                if not risk_params.get('can_trade', False):
+                    return False
+                
+                risk_level = risk_params.get('level', 'MEDIUM')
+                
+                trade_amount = self.current_capital * self.config.MAX_CAPITAL_PER_TRADE
+                quantity = trade_amount / price
+                
+                execution, error = self.execution_manager.execute_entry(symbol, quantity, price)
+                
+                if error:
+                    self.logger.error(f"❌ فشل تنفيذ الدخول لـ {symbol}: {error}")
+                    return False
+                
+                trade_id = f"T{int(time.time())}_{symbol.replace('/', '_')}_{risk_level[:1]}"
+                
+                stop_loss = self.risk_manager.calculate_stop_loss(price, risk_params)
+                take_profit = price * (1 + self.config.TAKE_PROFIT_PERCENT)
+                
+                trade = TradeRecord(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    entry_price=execution.net_price_entry,
+                    entry_time=datetime.now(timezone.utc).isoformat(),
+                    quantity=execution.entry_order.filled,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    original_take_profit=take_profit,
+                    phase="ENTRY",
+                    highest_price=execution.net_price_entry,
+                    score=score,
+                    risk_level=risk_level,
+                    execution_id=execution.trade_id
+                )
+                
+                # خصم قيمة الصفقة من الرصيد المتاح
+                trade_cost = execution.net_price_entry * execution.entry_order.filled
+                self.available_capital -= trade_cost
+                
+                # إنشاء أوامر Stop-Loss و Take-Profit على المنصة (في وضع LIVE)
+                if self.trading_mode == TradingMode.LIVE:
+                    success, msg = self.execution_manager.create_exchange_orders(trade)
+                    if not success:
+                        self.logger.warning(f"⚠️ فشل إنشاء أوامر المنصة: {msg}")
+                
+                self.active_trades[trade_id] = trade
+                self._save_trade(trade)
+                self._save_execution(execution)
+                self.monitor.update_stats(trade, execution)
+                
+                self._send_notification(
+                    f"🚀 *صفقة جديدة [{risk_level}]*\n"
+                    f"• العملة: `{symbol}`\n"
+                    f"• السعر: `${execution.net_price_entry:.4f}`\n"
+                    f"• الكمية: `{execution.entry_order.filled:.6f}`\n"
+                    f"• التكلفة: `${trade_cost:.2f}`\n"
+                    f"• السكور: `{score:.1f}`\n"
+                    f"• Stop-Loss: `${stop_loss:.4f}`\n"
+                    f"• Take-Profit: `${take_profit:.4f}`"
+                )
+                
+                return True
+                
+        except Exception as e:
+            self.logger.error(f"خطأ في فتح صفقة {symbol}: {e}")
+            return False
+    
+    def manage_trades(self):
+        if not self.active_trades:
+            return
+        
+        current_prices = {}
+        for trade in self.active_trades.values():
+            try:
+                ticker = self.exchange.fetch_ticker(trade.symbol)
+                current_prices[trade.symbol] = ticker['last']
+            except Exception as e:
+                self.logger.error(f"خطأ في جلب سعر {trade.symbol}: {e}")
+                continue
+        
+        if not current_prices:
+            return
+        
+        with self.lock:
+            trades_to_close = []
+            
+            for trade_id, trade in list(self.active_trades.items()):
+                price = current_prices.get(trade.symbol)
+                if not price:
+                    continue
+                
+                if price > trade.highest_price:
+                    trade.highest_price = price
+                
+                # فحص أوامر المنصة أولاً (للوضع LIVE فقط)
+                platform_exit_reason = None
+                if self.trading_mode == TradingMode.LIVE:
+                    platform_exit_reason = self.execution_manager.check_exchange_order_status(trade)
+                
+                if platform_exit_reason:
+                    # تم تنفيذ أمر على المنصة
+                    execution, error = self.execution_manager.execute_exit(
+                        trade.symbol, trade.quantity, trade.execution_id
+                    )
+                    
+                    if error:
+                        self.logger.error(f"❌ فشل تنفيذ الخروج لـ {trade.symbol}: {error}")
+                        continue
+                    
+                    trade.exit_price = execution.net_price_exit
+                    trade.exit_time = datetime.now(timezone.utc).isoformat()
+                    trade.exit_reason = platform_exit_reason
+                    trade.status = "CLOSED"
+                    
+                    if execution.net_price_exit and execution.net_price_entry:
+                        trade.pnl = (execution.net_price_exit - execution.net_price_entry) * trade.quantity
+                    
+                    if trade.pnl:
+                        self.current_capital += trade.pnl
+                        self.available_capital += (trade.entry_price * trade.quantity)
+                        self.daily_pnl += trade.pnl
+                    
+                    # تنظيف أوامر المنصة المتبقية
+                    self.execution_manager.cleanup_exchange_orders(trade)
+                    
+                    self._save_trade(trade)
+                    self._save_execution(execution)
+                    self._move_to_closed(trade_id)
+                    self.monitor.update_stats(trade, execution)
+                    
+                    status = "✅" if trade.pnl and trade.pnl > 0 else "❌"
+                    pnl_amount = trade.pnl if trade.pnl else 0
+                    
+                    self._send_notification(
+                        f"{status} *إغلاق صفقة (منصة)*\n"
+                        f"• العملة: `{trade.symbol}`\n"
+                        f"• الدخول: `${trade.entry_price:.4f}`\n"
+                        f"• الخروج: `${execution.net_price_exit:.4f}`\n"
+                        f"• الكمية: `{trade.quantity:.6f}`\n"
+                        f"• P&L: `${pnl_amount:.4f}`\n"
+                        f"• الرسوم: `${execution.total_fees:.4f}`\n"
+                        f"• السبب: `{platform_exit_reason}`"
+                    )
+                    
+                    self.logger.info(f"{status} أغلقت صفقة {trade_id} من المنصة: ${pnl_amount:.4f}")
+                    trades_to_close.append(trade_id)
+                    continue
+                
+                # إدارة التوقف المتحرك (النظام الداخلي)
+                if (trade.phase == "ENTRY" and 
+                    price >= trade.entry_price * (1 + self.config.BREAKEVEN_TRIGGER)):
+                    trade.stop_loss = trade.entry_price
+                    trade.phase = "BREAKEVEN"
+                    trade.stop_loss_modified = True
+                    self.logger.info(f"{trade_id} انتقل لنقطة التعادل")
+                
+                if (trade.phase == "BREAKEVEN" and 
+                    price >= trade.entry_price * (1 + self.config.TRAILING_ACTIVATION)):
+                    trade.phase = "TRAILING"
+                    trade.take_profit = None
+                    trade.take_profit_modified = True
+                    self.logger.info(f"{trade_id} تفعيل التوقف المتحرك وإلغاء TP")
+                
+                if trade.phase == "TRAILING":
+                    trailing_distance = self.config.TRAILING_DISTANCE
+                    if trade.risk_level and self.config.ENABLE_DYNAMIC_RISK:
+                        risk_params = self.risk_manager.get_risk_parameters(trade.score or 0)
+                        trailing_distance = self.risk_manager.calculate_trailing_distance(risk_params)
+                    
+                    new_stop = trade.highest_price * (1 - trailing_distance)
+                    if new_stop > trade.stop_loss:
+                        trade.stop_loss = new_stop
+                        trade.stop_loss_modified = True
+                
+                # تحديث أوامر المنصة إذا لزم الأمر
+                if trade.stop_loss_modified or trade.take_profit_modified:
+                    success, msg = self.execution_manager.update_exchange_orders(trade)
+                    if success:
+                        self.logger.info(f"🔄 تم تحديث أوامر المنصة للصفقة {trade_id}: {msg}")
+                    else:
+                        self.logger.warning(f"⚠️ فشل تحديث أوامر المنصة للصفقة {trade_id}: {msg}")
+                
+                exit_reason = None
+                
+                if price <= trade.stop_loss:
+                    exit_reason = "STOP_LOSS"
+                
+                elif (trade.take_profit is not None and 
+                      trade.phase in ["ENTRY", "BREAKEVEN"] and 
+                      price >= trade.take_profit):
+                    exit_reason = "TAKE_PROFIT"
+                
+                if exit_reason:
+                    execution, error = self.execution_manager.execute_exit(
+                        trade.symbol, trade.quantity, trade.execution_id
+                    )
+                    
+                    if error:
+                        self.logger.error(f"❌ فشل تنفيذ الخروج لـ {trade.symbol}: {error}")
+                        continue
+                    
+                    trade.exit_price = execution.net_price_exit
+                    trade.exit_time = datetime.now(timezone.utc).isoformat()
+                    trade.exit_reason = exit_reason
+                    trade.status = "CLOSED"
+                    
+                    if execution.net_price_exit and execution.net_price_entry:
+                        trade.pnl = (execution.net_price_exit - execution.net_price_entry) * trade.quantity
+                    
+                    if trade.pnl:
+                        self.current_capital += trade.pnl
+                        self.available_capital += (trade.entry_price * trade.quantity)
+                        self.daily_pnl += trade.pnl
+                    
+                    # تنظيف أوامر المنصة المتبقية
+                    if self.trading_mode == TradingMode.LIVE:
+                        self.execution_manager.cleanup_exchange_orders(trade)
+                    
+                    self._save_trade(trade)
+                    self._save_execution(execution)
+                    self._move_to_closed(trade_id)
+                    self.monitor.update_stats(trade, execution)
+                    
+                    status = "✅" if trade.pnl and trade.pnl > 0 else "❌"
+                    pnl_amount = trade.pnl if trade.pnl else 0
+                    
+                    self._send_notification(
+                        f"{status} *إغلاق صفقة*\n"
+                        f"• العملة: `{trade.symbol}`\n"
+                        f"• الدخول: `${trade.entry_price:.4f}`\n"
+                        f"• الخروج: `${execution.net_price_exit:.4f}`\n"
+                        f"• الكمية: `{trade.quantity:.6f}`\n"
+                        f"• P&L: `${pnl_amount:.4f}`\n"
+                        f"• الرسوم: `${execution.total_fees:.4f}`\n"
+                        f"• السبب: `{exit_reason}`"
+                    )
+                    
+                    self.logger.info(f"{status} أغلقت صفقة {trade_id}: ${pnl_amount:.4f}")
+                    trades_to_close.append(trade_id)
+                
+                else:
+                    self._save_trade(trade)
+            
+            for trade_id in trades_to_close:
+                if trade_id in self.active_trades:
+                    del self.active_trades[trade_id]
+    
+    def _reset_daily_pnl_if_needed(self):
+        today = datetime.now(timezone.utc).date()
+        
+        if today > self.last_reset_date:
+            old_pnl = self.daily_pnl
+            self.daily_pnl = 0.0
+            self.last_reset_date = today
+            
+            self.logger.info(f"🔄 تم تصفير P&L اليومي: ${old_pnl:.2f} → ${self.daily_pnl:.2f}")
+            
+            if old_pnl != 0:
+                self._send_notification(
+                    f"📅 *بداية يوم جديد*\n"
+                    f"• التاريخ: `{today}`\n"
+                    f"• P&L السابق: `${old_pnl:.2f}`\n"
+                    f"• P&L الجديد: `${self.daily_pnl:.2f}`"
+                )
+    
+    def run_cycle(self):
+        # تحديث الرصيد من المنصة (للوضع LIVE فقط)
+        if self.trading_mode == TradingMode.LIVE:
+            self._update_live_balance()
+        
+        self._reset_daily_pnl_if_needed()
+        
+        # التحقق من وقت السوق
+        current_hour = datetime.now(timezone.utc).hour
+        if current_hour in self.config.AVOID_HOURS:
+            if not self.active_trades:
+                self.logger.info("⏸️ وقت سوق غير مناسب - انتظار...")
+                return
+        
+        # 🔍 1. مرحلة المسح
+        self.logger.info("🔍 بدء مرحلة المسح...")
+        scan_results = self.scan_symbols()
+        
+        if not scan_results:
+            self.manage_trades()
+            return
+        
+        # 🎯 2. مرحلة الفلترة (مع الفلاتر الجديدة)
+        self.logger.info("🎯 بدء مرحلة الفلترة...")
+        
+        # تحليل حالة السوق (Bear Market Filter)
+        market_condition = self.bear_market_filter.analyze_market_condition(self.exchange)
+        self.logger.info(f"📊 حالة السوق: {market_condition.get('condition')}")
+        
+        # فلترة الأساسية
+        filtered_results = self.filter_symbols(scan_results)
+        
+        if not filtered_results:
+            self.manage_trades()
+            return
+        
+        # 📊 3. مرحلة الترتيب
+        self.logger.info("📊 بدء مرحلة الترتيب...")
+        ranked_symbols = self.rank_symbols(filtered_results)
+        
+        # تطبيق Ethical Filter
+        ranked_symbols = self.ethical_filter.filter_symbols(ranked_symbols)
+        
+        # تطبيق Bear Market Filter
+        ranked_symbols = self.bear_market_filter.apply_filter(ranked_symbols, market_condition)
+        
+        # ⚡ 4. مرحلة التنفيذ
+        self.logger.info("⚡ بدء مرحلة التنفيذ...")
+        self.execute_trades(ranked_symbols)
+        
+        # إدارة الصفقات الحالية
+        self.manage_trades()
+        
+        # تحديث إحصائيات المنصة
+        stats = self.exchange_interface.get_execution_stats()
+        self.monitor.update_platform_stats(stats)
+        
+        # 📈 5. التقارير
+        report = self.monitor.generate_daily_report()
+        print(report)
+        
+        # إحصائيات التنفيذ
+        self.logger.info(
+            f"📊 إحصائيات التنفيذ: نجاح={stats['successful_orders']}, "
+            f"رسوم=${stats['total_fees']:.4f}, "
+            f"انزلاق={stats['total_slippage']:.4f}, "
+            f"أوامر منصة={stats['platform_orders_created']}"
+        )
+        
+        # إرسال تحديث دوري
+        self._send_periodic_update(market_condition)
+    
+    def _send_periodic_update(self, market_condition: Dict):
+        """إرسال تحديث دوري عن حالة النظام"""
+        try:
+            update_count = getattr(self, '_update_count', 0) + 1
+            self._update_count = update_count
+            
+            # كل 5 دورات نرسل تحديث
+            if update_count % 5 == 0:
+                condition = market_condition.get('condition', 'UNKNOWN')
+                active_trades = len(self.active_trades)
+                
+                message = (
+                    f"📈 *تحديث النظام*\n"
+                    f"• الوضع: `{self.trading_mode.value}`\n"
+                    f"• حالة السوق: `{condition}`\n"
+                    f"• الصفقات النشطة: `{active_trades}`\n"
+                    f"• P&L اليوم: `${self.daily_pnl:.2f}`\n"
+                    f"• الخسارة الكلية: `{self.total_drawdown_percent:.1f}%`\n"
+                    f"• التحديث: `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`"
+                )
+                
+                self._send_notification(message)
+                
+        except Exception as e:
+            self.logger.error(f"خطأ في إرسال التحديث: {e}")
+    
+    def process_external_command(self, command: str) -> str:
+        """
+        معالجة أمر من واجهة خارجية (CLI، إلخ)
+        """
+        if not command.startswith('/'):
+            command = '/' + command
+        
+        parts = command.split()
+        cmd = parts[0]
+        args = parts[1:] if len(parts) > 1 else []
+        
+        return self.command_handler.handle_command(cmd, args)
+    
+    def run(self):
+        self.logger.info("🚀 بدء تشغيل StableBotPro v4.0...")
+        
+        report_counter = 0
+        while True:
+            try:
+                self.run_cycle()
+                report_counter += 1
+                
+                if report_counter % 10 == 0:
+                    report = self.monitor.generate_daily_report()
+                    self._send_notification(report)
+                    report_counter = 0
+                
+                time.sleep(self.config.SCAN_INTERVAL)
+                
+            except KeyboardInterrupt:
+                self.logger.info("🛑 إيقاف البوت بواسطة المستخدم")
+                break
+            except Exception as e:
+                self.logger.error(f"🚨 خطأ في الدورة الرئيسية: {e}")
+                time.sleep(60)
+
+# ==================== التشغيل الرئيسي ====================
+def main():
+    print("=" * 70)
+    print("🤖 StableBot Pro v4.0 - النسخة النهائية مع تحسينات LIVE-Safe")
+    print("=" * 70)
+    print("🎯 المميزات الجديدة:")
+    print("  • ربط الرصيد الحقيقي مع fetch_balance()")
+    print("  • تنفيذ Stop-Loss/Take-Profit على المنصة")
+    print("  • Max Total Drawdown كنقطة أمان عامة")
+    print("  • نظام إدارة الوضع عبر Telegram")
+    print("=" * 70)
+    print("📋 مسار النظام: Scan → Filter → Rank → Execute")
+    print("⚡ Dynamic Risk Manager: نشط")
+    print("🛡️  الحماية: Drawdown + فلاتر أمان + أوامر منصة")
+    print("=" * 70)
+    
+    mode = TradingMode.PAPER
+    
+    if os.getenv('TRADING_MODE', 'PAPER').upper() == 'LIVE':
+        mode = TradingMode.LIVE
+        print("⚠️  تحذير: وضع التداول الحي مفعّل!")
+        print("    تأكد من إعداد API keys في ملف .env")
+    else:
+        print("📝 الوضع الافتراضي: Paper Trading")
+        print("    للتحويل إلى LIVE استخدم: /mode live")
+    
+    bot = StableBotPro(trading_mode=mode)
+    
+    telegram_thread = threading.Thread(target=bot.run)
+    telegram_thread.start()
+    telegram_thread.join()
+    
+    # واجهة أوامر بسيطة
+    print("\n💬 أوامر النظام (في التيرمينال):")
+    print("  • status - حالة البوت")
+    print("  • mode paper/live - تبديل الوضع")
+    print("  • balance - الرصيد الحقيقي")
+    print("  • drawdown - نسبة الخسارة الكلية")
+    print("  • stats - إحصائيات اليوم")
+    print("  • trades - الصفقات النشطة")
+    print("  • exit - إيقاف البوت")
+    print("=" * 70)
+    
+    # تعطيل الـ CLI input للتشغيل غير التفاعلي (مثل Railway)
+    # بدلاً من input()، نستخدم حلقة sleep للحفاظ على الـ main thread حيًا دون تفاعل
+    # هذا يمنع EOF error ويسمح للـ bot.run() بالعمل.
+    while True:
+        time.sleep(60)  # انتظار دون إدخال يدوي
+
+if __name__ == "__main__":
+    main()
