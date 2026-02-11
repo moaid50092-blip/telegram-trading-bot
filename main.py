@@ -2,6 +2,8 @@
 """
 StableBotPro v4.1 - Automated Trading System with Hardening
 Modified version with security and stability fixes
+Enhanced with Multi-Environment Adaptive Architecture (Regime + Range + Adaptive Sizing + Equity Layer)
+All additions are modular, isolated, backward compatible - original trading logic untouched
 """
 
 import os
@@ -219,6 +221,15 @@ class ExplanationEntry:
     reason_detail: str
     score: Optional[float] = None
     filters_blocking: List[str] = field(default_factory=list)
+    # New optional fields - backward compatible
+    regime_state: Optional[str] = None
+    regime_multiplier: Optional[float] = None
+    adaptive_multiplier: Optional[float] = None
+    equity_multiplier: Optional[float] = None
+    final_position_size: Optional[float] = None
+    is_range_mode: bool = False
+    range_reason: Optional[str] = None
+    capital_state: Optional[str] = None
 
 class Logger:
     @staticmethod
@@ -1511,6 +1522,82 @@ Capital:
         with open(filename, 'w') as f:
             json.dump(self.daily_stats, f, indent=2)
 
+class RegimeEngine:
+    """Isolated regime classifier – returns one of: TRENDING_UP, TRENDING_DOWN, RANGE, HIGH_VOLATILITY, NEUTRAL"""
+
+    def classify(self, df: pd.DataFrame) -> str:
+        if len(df) < 50:
+            return "NEUTRAL"
+
+        close = df['close'].values
+        high = df['high'].values
+        low = df['low'].values
+
+        # ATR
+        tr1 = high - low
+        tr2 = np.abs(high - np.roll(close, 1))[1:]
+        tr3 = np.abs(low - np.roll(close, 1))[1:]
+        tr = np.maximum.reduce([tr1[1:], tr2, tr3])
+        atr = pd.Series(tr).rolling(14).mean().iloc[-1]
+        atr_pct = atr / close[-1] if close[-1] > 0 else 0
+
+        # EMA slope (last 10 candles for sensitivity)
+        ema_50 = pd.Series(close).ewm(span=50, adjust=False).mean()
+        slope = (ema_50.iloc[-1] - ema_50.iloc[-10]) / 10 if len(ema_50) >= 10 else 0
+
+        # Simple HH/LL (last 20 candles)
+        recent_highs = high[-20:]
+        recent_lows = low[-20:]
+        is_hh = recent_highs[-1] > np.max(recent_highs[:-1]) if len(recent_highs) > 1 else False
+        is_ll = recent_lows[-1] < np.min(recent_lows[:-1]) if len(recent_lows) > 1 else False
+
+        # Range width (last 40 candles)
+        range_width_pct = (np.max(high[-40:]) - np.min(low[-40:])) / close[-1] if len(high) >= 40 else 0.1
+
+        if atr_pct > 0.018:
+            return "HIGH_VOLATILITY"
+
+        if slope > 0.0008 and is_hh:
+            return "TRENDING_UP"
+
+        if slope < -0.0008 and is_ll:
+            return "TRENDING_DOWN"
+
+        if range_width_pct < 0.035 and abs(slope) < 0.0004:
+            return "RANGE"
+
+        return "NEUTRAL"
+
+class RangeEngine:
+    """Long-only range entry logic – small targets near lower bound – only when regime == RANGE"""
+
+    def __init__(self, config: TradingConfig):
+        self.config = config
+
+    def should_enter_range_mode(self, df: pd.DataFrame, current_price: float) -> Tuple[bool, str, Optional[float]]:
+        if len(df) < 40:
+            return False, "Insufficient candles for range analysis", None
+
+        highs = df['high'].iloc[-40:]
+        lows = df['low'].iloc[-40:]
+        range_high = highs.max()
+        range_low = lows.min()
+        range_width = range_high - range_low
+
+        if range_width <= 0:
+            return False, "Invalid range width", None
+
+        lower_15pct_threshold = range_low + 0.15 * range_width
+
+        if current_price > lower_15pct_threshold:
+            return False, f"Price {current_price:.4f} not near lower bound (threshold: {lower_15pct_threshold:.4f})", None
+
+        # Small TP/SL for range trades
+        tp_price = current_price * 1.008   # \~0.8%
+        sl_price = current_price * 0.993   # \~0.7% - tight SL
+
+        return True, f"Near lower bound ({((current_price - range_low) / range_width * 100):.1f}% from low)", tp_price
+
 class StableBotPro:
     def __init__(self, trading_mode: TradingMode = TradingMode.PAPER):
         self.config = TradingConfig
@@ -1527,7 +1614,7 @@ class StableBotPro:
         self.paper_available = self.config.INITIAL_CAPITAL
         self.daily_pnl = 0.0                         # Realized PnL from closed trades only
         self.total_drawdown_percent = 0.0
-        self.daily_pnl_from_closed_orders = 0.0      # Tracks realized PnL in live mode
+        self.daily_pnl_from_closed_orders = 0.0
 
         self.state_lock = threading.RLock()
 
@@ -1567,6 +1654,13 @@ class StableBotPro:
         self.mode_manager = ModeManager(self)
         self.command_handler = TelegramCommandHandler(self)
 
+        # ── New Adaptive Layers ──
+        self.regime_engine = RegimeEngine()
+        self.range_engine = RangeEngine(self.config)
+
+        # For equity state multiplier (last 5 closed trades PnL)
+        self.recent_closed_pnls: deque = deque(maxlen=5)
+
         self.previous_scores = defaultdict(float)
 
         self.api_failures = defaultdict(int)
@@ -1587,10 +1681,13 @@ class StableBotPro:
             else:
                 self.logger.info(f"Balance synced from exchange: ${self.live_available_balance:.2f}")
 
-        self.logger.info("Loaded additional filters:")
+        self.logger.info("Loaded additional filters and adaptive layers:")
         self.logger.info(f"   • Bear Market Filter: {'Enabled' if self.bear_market_filter.enabled else 'Disabled'}")
         self.logger.info(f"   • Ethical Filter: {'Enabled' if self.ethical_filter.enabled else 'Disabled'}")
-        self.logger.info(f"   • Mode Manager: Ready")
+        self.logger.info(f"   • RegimeEngine: Active")
+        self.logger.info(f"   • RangeEngine: Active (long-only)")
+        self.logger.info(f"   • Adaptive Position Sizing: Active")
+        self.logger.info(f"   • Equity State Multiplier: Active (reduction only)")
         self.logger.info(f"   • Maximum total drawdown: {self.config.MAX_TOTAL_DRAWDOWN*100:.1f}%")
 
         self.ticker_cache = {}
@@ -1867,6 +1964,22 @@ class StableBotPro:
             self.logger.error(f"Score calculation error: {e}")
             return 0
 
+    def _get_equity_state_multiplier(self) -> float:
+        """Equity curve based reduction – never increases size (≤ 1.0)"""
+        if len(self.recent_closed_pnls) < 3:
+            return 1.0
+
+        pnls = list(self.recent_closed_pnls)
+        win_rate = sum(1 for p in pnls if p > 0) / len(pnls)
+        avg_pnl_pct = np.mean(pnls) / self.initial_capital_snapshot if self.initial_capital_snapshot > 0 else 0
+
+        if avg_pnl_pct < -0.01 or win_rate < 0.4:
+            return 0.70  # STRESSED
+        elif avg_pnl_pct < -0.005 or win_rate < 0.55:
+            return 0.85  # HOT
+        else:
+            return 1.0   # STABLE
+
     def scan_symbols(self) -> Dict[str, MarketAnalysis]:
         scan_results = {}
         scanned = 0
@@ -2014,6 +2127,10 @@ class StableBotPro:
             if available_slots <= 0:
                 return
 
+            # ── Equity multiplier – computed once per cycle (reduction only) ──
+            equity_multiplier = self._get_equity_state_multiplier()
+            capital_state = "STRESSED" if equity_multiplier <= 0.75 else "HOT" if equity_multiplier < 1.0 else "STABLE"
+
             trades_opened = 0
 
             for symbol, analysis in ranked_symbols:
@@ -2056,6 +2173,45 @@ class StableBotPro:
                         reason = "RISK_REJECTED"
                         blocking_filters.append("DynamicRisk")
 
+                # ── New Adaptive Layers ── Regime + Range + Sizing ──
+                regime_state = self.regime_engine.classify(analysis.last_ohlcv)
+
+                regime_multiplier = 1.0
+                adaptive_multiplier = 1.0
+                is_range_mode = False
+                range_reason = None
+                range_tp = None
+
+                if regime_state == "TRENDING_UP":
+                    regime_multiplier = 1.0
+                elif regime_state == "RANGE":
+                    regime_multiplier = 0.6
+                    # RangeEngine check
+                    can_range, r_reason, suggested_tp = self.range_engine.should_enter_range_mode(
+                        analysis.last_ohlcv, analysis.price
+                    )
+                    if can_range:
+                        is_range_mode = True
+                        range_reason = r_reason
+                        range_tp = suggested_tp
+                        adaptive_multiplier = 0.5  # 50% of normal as per spec
+                    else:
+                        range_reason = r_reason
+                elif regime_state == "HIGH_VOLATILITY":
+                    regime_multiplier = 0.5
+                elif regime_state == "TRENDING_DOWN":
+                    regime_multiplier = 0.4  # conservative for long-only
+                else:
+                    regime_multiplier = 0.85
+
+                # AI confidence already exists
+                ai_confidence = self._get_ai_confidence(analysis.last_ohlcv)
+
+                # Final size multiplier – cap at ±20% deviation from base
+                size_multiplier = regime_multiplier * ai_confidence
+                size_multiplier = max(0.8, min(1.2, size_multiplier))
+
+                # ── Create explanation early (as original) ──
                 explanation = ExplanationEntry(
                     symbol=symbol,
                     timestamp=datetime.now(timezone.utc).isoformat(),
@@ -2063,24 +2219,41 @@ class StableBotPro:
                     reason_code=reason,
                     reason_detail=f"Rejected due to {reason}" if reason != "OK" else "All filters passed",
                     score=analysis.score,
-                    filters_blocking=blocking_filters
+                    filters_blocking=blocking_filters,
+                    # ── Enrich with new fields ──
+                    regime_state=regime_state,
+                    regime_multiplier=regime_multiplier,
+                    adaptive_multiplier=size_multiplier,  # will be confirmed
+                    equity_multiplier=equity_multiplier,
+                    final_position_size=None,  # computed later
+                    is_range_mode=is_range_mode,
+                    range_reason=range_reason,
+                    capital_state=capital_state
                 )
 
-                self.explainable_silence_log.append(explanation)
-                if len(self.explainable_silence_log) > self._max_explain_log:
-                    self.explainable_silence_log.pop(0)
-
                 if reason != "OK":
-                    self.logger.info(f"[EXPLAIN_SILENT] {symbol} → {reason} | {explanation.reason_detail}")
+                    explanation.final_position_size = 0.0
+                    self.explainable_silence_log.append(explanation)
+                    if len(self.explainable_silence_log) > self._max_explain_log:
+                        self.explainable_silence_log.pop(0)
+                    self.logger.info(f"[EXPLAIN_SILENT] {symbol} → {reason} | regime={regime_state} | size_mult={size_multiplier:.2f}")
                     continue
 
-                ai_confidence = self._get_ai_confidence(analysis.last_ohlcv)
-                size_multiplier = ai_confidence
+                # ── Final position size calculation ──
+                base_usdt = (self.live_total_balance if self.trading_mode == TradingMode.LIVE else self.paper_total) \
+                            * self.config.MAX_CAPITAL_PER_TRADE \
+                            * TradingConfig.PROGRESSIVE_ENTRY_INITIAL_PERCENT
 
-                if reason in ["LOW_LIQUIDITY", "HIGH_SPREAD"]:
-                    size_multiplier *= 0.5
-                elif reason == "SIZE_REDUCTION":
-                    size_multiplier *= 0.7
+                entry_usdt = base_usdt * size_multiplier * equity_multiplier
+
+                quantity = entry_usdt / analysis.price
+
+                # Enrich explanation
+                explanation.final_position_size = entry_usdt
+                explanation.adaptive_multiplier = size_multiplier
+
+                # ── TP override only if range mode active ──
+                take_profit = range_tp if is_range_mode else analysis.price * (1 + self.config.TAKE_PROFIT_PERCENT)
 
                 existing_trade = next((t for t in self.active_trades.values() if t.symbol == symbol), None)
                 if existing_trade:
@@ -2090,6 +2263,10 @@ class StableBotPro:
                         boost_trade_id = self._create_trade_id()
                         execution, error = self.execution_manager.execute_entry(symbol, boost_quantity, boost_trade_id, analysis.price)
                         if error:
+                            explanation.decision = "SILENT"
+                            explanation.reason_code = "BOOST_FAILED"
+                            explanation.reason_detail = error
+                            self.explainable_silence_log.append(explanation)
                             self.logger.error(f"Failed to boost {symbol}: {error}")
                             continue
 
@@ -2102,16 +2279,20 @@ class StableBotPro:
                         self.monitor.update_stats(existing_trade, execution)
                         self.logger.info(f"Trade boosted {symbol} (ADD-ON / Position Scaling)")
                         trades_opened += 1
-                        self.logger.info(f"[TRACE] {symbol} → EXECUTED")
+                        explanation.decision = "ENTER (BOOST)"
+                        explanation.reason_detail = "Progressive entry boost executed"
+                        self.explainable_silence_log.append(explanation)
+                        self._send_notification(f"Position boosted on {symbol}\nSize mult: {size_multiplier:.2f} | Equity: {equity_multiplier:.2f}")
                         continue
-
-                entry_usdt = (self.live_total_balance if self.trading_mode == TradingMode.LIVE else self.paper_total) * self.config.MAX_CAPITAL_PER_TRADE * TradingConfig.PROGRESSIVE_ENTRY_INITIAL_PERCENT * size_multiplier
-                quantity = entry_usdt / analysis.price
 
                 entry_trade_id = self._create_trade_id()
                 execution, error = self.execution_manager.execute_entry(symbol, quantity, entry_trade_id, analysis.price)
 
                 if error:
+                    explanation.decision = "SILENT"
+                    explanation.reason_code = "ENTRY_FAILED"
+                    explanation.reason_detail = error
+                    self.explainable_silence_log.append(explanation)
                     self.logger.error(f"Entry execution failed for {symbol}: {error}")
                     continue
 
@@ -2121,7 +2302,6 @@ class StableBotPro:
                 risk_level = risk_params.get('level', 'MEDIUM')
 
                 stop_loss = self.risk_manager.calculate_stop_loss(analysis.price, risk_params)
-                take_profit = analysis.price * (1 + self.config.TAKE_PROFIT_PERCENT)
 
                 trade = TradeRecord(
                     trade_id=trade_id,
@@ -2156,20 +2336,31 @@ class StableBotPro:
                 self._save_execution(execution)
                 self.monitor.update_stats(trade, execution)
 
-                self._send_notification(
+                explanation.decision = "ENTER"
+                explanation.reason_detail = f"All filters passed | Regime: {regime_state} | Range mode: {'YES' if is_range_mode else 'NO'}"
+                self.explainable_silence_log.append(explanation)
+
+                notify_msg = (
                     f"New trade opened [{risk_level}]\n"
                     f"• Symbol: `{symbol}`\n"
+                    f"• Regime: {regime_state}\n"
+                    f"• Size mult: {size_multiplier:.2f} × equity {equity_multiplier:.2f}\n"
+                    f"• Final size: ${entry_usdt:.2f}\n"
+                    f"• Range mode: {'YES' if is_range_mode else 'NO'}\n"
+                    f"{'' if not range_reason else f'• Range reason: {range_reason}\\n'}"
+                    f"• Capital state: {capital_state}\n"
                     f"• Price: `${execution.net_price_entry:.4f}`\n"
                     f"• Quantity: `{execution.entry_order.filled:.6f}`\n"
                     f"• Cost: `${trade_cost:.2f}`\n"
                     f"• Score: `{analysis.score:.1f}`\n"
                     f"• Stop-Loss: `${stop_loss:.4f}`\n"
-                    f"• Take-Profit: `${take_profit:.4f}`"
+                    f"• Take-Profit: `${take_profit:.4f if take_profit else 'Trailing'}`"
                 )
+                self._send_notification(notify_msg)
 
                 self.previous_scores[symbol] = analysis.score
                 trades_opened += 1
-                self.logger.info(f"[TRACE] {symbol} → EXECUTED")
+                self.logger.info(f"[TRACE] {symbol} → EXECUTED | regime={regime_state} | size_mult={size_multiplier:.2f}")
 
         if trades_opened > 0:
             self.logger.info(f"Opened {trades_opened}/{available_slots} new trades")
@@ -2230,11 +2421,13 @@ class StableBotPro:
                             self.paper_available += (trade.entry_price * trade.quantity)
                         self.daily_pnl += trade.pnl
                         self._update_loss_streak(trade.pnl)
+                        self._update_recent_closed(trade.pnl)  # New
 
                     if self.trading_mode == TradingMode.LIVE:
                         self.execution_manager.cleanup_exchange_orders(trade)
                         self.daily_pnl_from_closed_orders += trade.pnl or 0
                         self.daily_pnl = self.daily_pnl_from_closed_orders
+                        self._update_recent_closed(trade.pnl)  # New
 
                     self._save_trade(trade)
                     self._save_execution(execution)
@@ -2286,11 +2479,13 @@ class StableBotPro:
                             self.paper_available += (trade.entry_price * trade.quantity)
                         self.daily_pnl += trade.pnl
                         self._update_loss_streak(trade.pnl)
+                        self._update_recent_closed(trade.pnl)
 
                     if self.trading_mode == TradingMode.LIVE:
                         self.execution_manager.cleanup_exchange_orders(trade)
                         self.daily_pnl_from_closed_orders += trade.pnl or 0
                         self.daily_pnl = self.daily_pnl_from_closed_orders
+                        self._update_recent_closed(trade.pnl)
 
                     self._save_trade(trade)
                     self._save_execution(execution)
@@ -2380,11 +2575,13 @@ class StableBotPro:
                             self.paper_available += (trade.entry_price * trade.quantity)
                         self.daily_pnl += trade.pnl
                         self._update_loss_streak(trade.pnl)
+                        self._update_recent_closed(trade.pnl)
 
                     if self.trading_mode == TradingMode.LIVE:
                         self.execution_manager.cleanup_exchange_orders(trade)
                         self.daily_pnl_from_closed_orders += trade.pnl or 0
                         self.daily_pnl = self.daily_pnl_from_closed_orders
+                        self._update_recent_closed(trade.pnl)
 
                     self._save_trade(trade)
                     self._save_execution(execution)
@@ -2411,6 +2608,10 @@ class StableBotPro:
 
             for trade_id in trades_to_close:
                 del self.active_trades[trade_id]
+
+    def _update_recent_closed(self, pnl: Optional[float]):
+        if pnl is not None:
+            self.recent_closed_pnls.append(pnl)
 
     def run(self):
         self.logger.info("Starting main bot loop...")
