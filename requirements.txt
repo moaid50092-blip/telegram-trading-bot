@@ -1,6 +1,7 @@
-ccxt
+ccxt==4.2.99
 pandas
 numpy
 python-dotenv
 requests
-scipy
+aiohttp
+websockets
