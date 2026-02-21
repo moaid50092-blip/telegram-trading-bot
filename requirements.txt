@@ -1,7 +1,6 @@
-ccxt==4.2.99
-pandas
-numpy
-python-dotenv
-requests
-aiohttp
-websockets
+ccxt==4.2.74
+requests==2.31.0
+pandas==2.2.0
+numpy==1.26.3
+python-dotenv==1.0.1
+schedule==1.2.1
